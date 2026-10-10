@@ -1,27 +1,28 @@
 schema: xgc2.product.v1
 id: libxgc2-chassis-hold-dev
 name: XGC2 Chassis HOLD
-version: 0.1.0-1
+version: 1.0.0-1
 kind: toolchain-apt
-summary: Chassis command gating with state-machine regions and composable XRPC hosts.
+summary: Chassis HOLD domain library and transport-neutral JSON service shared by XGC2 chassis drivers and simulation hosts.
 apt:
-  distribution: focal
+  distribution: bionic,focal,jammy,noble
   install:
   - libxgc2-chassis-hold-dev
   packages:
-  - libxgc2-chassis-hold0
+  - libxgc2-chassis-hold1
   - libxgc2-chassis-hold-dev
   depends:
-  - libxgc2-xrpc1 (>= 0.1.0-2~focal)
-  - libxgc2-state-machine-dev (>= 0.1.3-12~focal)
+  - libc6
+  - libgcc1 | libgcc-s1
+  - libstdc++6
 usage:
   install: sudo apt install libxgc2-chassis-hold-dev
   smoke_test: cmake --find-package -DNAME=XgcChassisHold -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++20. State has no RPC headers; Rpc adds routes without a listener; Server adds one listener and IO thread. Mutations and output gates belong to one native owner. Command-gated completion does not confirm physical rest.
+  notes: C++17. find_package(XgcChassisHold CONFIG COMPONENTS core) and link XgcChassisHold::core for the domain and the JSON service. Command-gated completion does not confirm physical rest.
 ownership:
   paths:
   - /usr/include/xgc2/chassis_hold
-  - /usr/lib/*/libxgc2_chassis_hold_*.so*
+  - /usr/lib/*/libxgc2_chassis_hold*.so*
   - /usr/lib/*/cmake/XgcChassisHold
   - /usr/share/xgc2-chassis-hold/contracts
 release:
@@ -29,11 +30,10 @@ release:
   ref: main
   workflow: release.yml
   ci_workflow: ci.yml
-  requires:
-  - xgc2-xrpc
-  - libxgc2-state-machine-dev
-  dependency_policy:
-    xgc2-xrpc: rebuild
-    libxgc2-state-machine-dev: verify
+  requires: []
+  dependency_policy: {}
   apt_versions:
-    focal: 0.1.0-1~focal
+    bionic: 1.0.0-1~bionic
+    focal: 1.0.0-1~focal
+    jammy: 1.0.0-1~jammy
+    noble: 1.0.0-1~noble

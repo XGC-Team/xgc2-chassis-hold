@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build and test against installed SDKs. Outputs are never overwritten.
+# Build, test and package against the installed toolchain. Outputs are never overwritten.
+# Usage: build_debs.sh <fresh work directory> <output directory>
+# PACKAGE_DISTRIBUTION names the distribution the packages are for (default: this system's codename).
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$root" show -s --format=%ct HEAD)}"
@@ -12,17 +14,35 @@ work="$(realpath "$work")"
 out="$(realpath "$out")"
 arch="$(dpkg --print-architecture)"
 multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-version="$(awk '$1 == "focal:" { print $2; exit }' "$root/.xgc2/product.yml")"
+distribution="${PACKAGE_DISTRIBUTION:-}"
+if [[ -z "$distribution" ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  distribution="${VERSION_CODENAME:?PACKAGE_DISTRIBUTION or VERSION_CODENAME is required}"
+fi
+# The version of this distribution's packages is the product version with the distribution suffix.
+version="$(awk -v key="$distribution:" '$1 == key { print $2; exit }' "$root/.xgc2/product.yml")"
 test -n "$version"
 dpkg --validate-version "$version"
-for package in libxgc2-chassis-hold0 libxgc2-chassis-hold-dev; do
+test "$version" = "$(sed -n 's/^version:[[:space:]]*//p' "$root/.xgc2/product.yml" | head -n 1)~$distribution"
+runtime_package=libxgc2-chassis-hold1
+dev_package=libxgc2-chassis-hold-dev
+for package in "$runtime_package" "$dev_package"; do
   test ! -e "$out/${package}_${version}_${arch}.deb"
 done
-cmake -S "$root" -B "$work/build" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR="lib/$multiarch"
-cmake --build "$work/build" --parallel 2
+
+cmake_args=("-DCMAKE_BUILD_TYPE=RelWithDebInfo" "-DCMAKE_INSTALL_PREFIX=/usr" "-DCMAKE_INSTALL_LIBDIR=lib/$multiarch")
+# Warnings are errors only with the compiler the code is verified with in CI; newer ones report on their own.
+if [[ "$distribution" == focal ]]; then
+  cmake_args+=("-DXGC2_CHASSIS_HOLD_WERROR=ON")
+fi
+# No `cmake -S/-B` and no `--parallel`: Ubuntu 18.04 ships CMake 3.10.
+mkdir -p "$work/build"
+(cd "$work/build" && cmake "$root" "${cmake_args[@]}")
+cmake --build "$work/build" -- -j"${XGC2_BUILD_JOBS:-2}"
 (cd "$work/build" && ctest --output-on-failure)
-DESTDIR="$work/stage" cmake --install "$work/build"
+DESTDIR="$work/stage" cmake --build "$work/build" --target install
+
 runtime="$work/runtime"
 dev="$work/dev"
 mkdir -p "$runtime/DEBIAN" "$runtime/usr/lib/$multiarch" "$dev/DEBIAN" "$dev/usr/lib/$multiarch"
@@ -33,45 +53,41 @@ for file in "$work/stage/usr/lib/$multiarch/"*.so*; do
   if [[ "$file" == *.so ]]; then cp -a "$file" "$dev/usr/lib/$multiarch/";
   else cp -a "$file" "$runtime/usr/lib/$multiarch/"; fi
 done
-for component in state rpc_handler server; do
-  printf 'libxgc2_chassis_hold_%s 0 libxgc2-chassis-hold0 (>= %s)\n' "$component" "$version"
-done > "$runtime/DEBIAN/shlibs"
+find "$runtime/usr/lib/$multiarch" -type f -name '*.so.*' -exec strip --strip-unneeded {} +
+printf 'libxgc2_chassis_hold 1 %s (>= %s)\n' "$runtime_package" "$version" > "$runtime/DEBIAN/shlibs"
 mkdir -p "$work/debian"
-printf 'Source: xgc2-chassis-hold\nSection: libs\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n\nPackage: libxgc2-chassis-hold0\nArchitecture: any\nDescription: Chassis command gating\n' > "$work/debian/control"
-cat "$runtime/DEBIAN/shlibs" > "$work/debian/shlibs.local"
-# The existing state-machine product ships its runtime in the dev package.
-printf 'libxgc2_state_machine 0 libxgc2-state-machine-dev (>= 0.1.3-12~focal)\n' >> "$work/debian/shlibs.local"
+printf 'Source: xgc2-chassis-hold\nSection: libs\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n\nPackage: %s\nArchitecture: any\nDescription: Chassis HOLD\n' \
+  "$runtime_package" > "$work/debian/control"
+cp "$runtime/DEBIAN/shlibs" "$work/debian/shlibs.local"
 pushd "$work" >/dev/null
 mapfile -t libraries < <(find "$runtime/usr/lib/$multiarch" -type f -name '*.so.*' | sort)
-depends="$(dpkg-shlibdeps -O -xlibxgc2-chassis-hold0 -l"$runtime/usr/lib/$multiarch" "${libraries[@]/#/-e}" | sed -n 's/^shlibs:Depends=//p')"
+depends="$(dpkg-shlibdeps -O -x"$runtime_package" -l"$runtime/usr/lib/$multiarch" "${libraries[@]/#/-e}" | sed -n 's/^shlibs:Depends=//p')"
 popd >/dev/null
 test -n "$depends"
 cat > "$runtime/DEBIAN/control" <<CONTROL
-Package: libxgc2-chassis-hold0
+Package: $runtime_package
 Version: $version
 Architecture: $arch
 Section: libs
 Priority: optional
 Maintainer: XGC Team <apt@example.com>
 Depends: $depends
-Description: XGC2 chassis command gating runtime
- State-machine regions, bounded RPC handler and standalone RPC host.
+Description: XGC2 chassis HOLD runtime
+ Domain library and transport-neutral JSON service for chassis command gating.
 CONTROL
 printf 'activate-noawait ldconfig\n' > "$runtime/DEBIAN/triggers"
 cat > "$dev/DEBIAN/control" <<CONTROL
-Package: libxgc2-chassis-hold-dev
+Package: $dev_package
 Version: $version
 Architecture: $arch
 Section: libdevel
 Priority: optional
 Maintainer: XGC Team <apt@example.com>
-Depends: libxgc2-chassis-hold0 (= $version), libxgc2-xrpc-dev (>= 0.1.0-2~focal)
-Breaks: libxgc2-robotics-interfaces-dev (<< 0.2.0-3~focal)
-Replaces: libxgc2-robotics-interfaces-dev (<< 0.2.0-3~focal)
-Description: XGC2 chassis command gating development library
- C++20 State, Rpc and Server components with explicit host ownership.
+Depends: $runtime_package (= $version)
+Description: XGC2 chassis HOLD development files
+ C++17 headers, CMake package XgcChassisHold (component core) and the HOLD contract.
 CONTROL
-for spec in "runtime libxgc2-chassis-hold0" "dev libxgc2-chassis-hold-dev"; do
+for spec in "runtime $runtime_package" "dev $dev_package"; do
   read -r dir package <<<"$spec"
   mkdir -p "$work/$dir/usr/share/doc/$package"
   cp "$root/LICENSE" "$work/$dir/usr/share/doc/$package/copyright"
