@@ -1,51 +1,75 @@
 # XGC2 Chassis HOLD
 
-Command gating for a fixed roster of 1–16 chassis. HOLD and release both clear
-native command output; release never replays the cached command. Completion
-confirms command gating and zero output, not measured physical rest.
+HOLD stops one robot's chassis from executing motion commands until it is explicitly released. This repository
+is the shared C++17 implementation used by the Wheeltec and AgileX chassis drivers and by the Gazebo and xsim
+world hosts. The behavior and the wire surface are defined in [chassis-hold-v2](contracts/chassis-hold-v2.md).
 
-| Component | Responsibility | Dependencies |
-| --- | --- | --- |
-| `HoldState` / `XgcChassisHold::State` | Held/Released region per robot, revision and batch semantics | xgc2-state-machine |
-| `HoldRpcHandler` / `XgcChassisHold::Rpc` | HOLD schema, bounded admission, native completion | State, XRPC JSON-HTTP |
-| `HoldServer` / `XgcChassisHold::Server` | Own listener and IO thread | Rpc |
+| Component | CMake target | Contents | Needs |
+| --- | --- | --- | --- |
+| `core` | `XgcChassisHold::core` | `Domain` (HOLD state, admission, tick, feedback) and `Service` (the JSON methods `Describe`, `State`, `Engage`, `Release`) | C++17 standard library; nlohmann-json at build time only |
 
-Physical drivers use `HoldServer`. Frameworks such as Gazebo compose
-`HoldRpcHandler` with their existing XRPC server and resolved host policy.
-There is no transport mode flag, per-robot server, or per-robot worker.
+The domain has no transport, no ROS and no state machine. A host owns the transport: drivers expose `Service`
+over `udp.v1`, the world hosts over their existing `http.v1` server.
 
 ```cmake
-find_package(XgcChassisHold 0.1.0 CONFIG REQUIRED COMPONENTS Server)
-target_link_libraries(my_driver PRIVATE XgcChassisHold::Server)
+find_package(XgcChassisHold 1.0.0 CONFIG REQUIRED COMPONENTS core)
+target_link_libraries(my_host PRIVATE XgcChassisHold::core)
 ```
+
+## Using the domain
 
 ```cpp
-#include <xgc2/chassis_hold/server.hpp>
-xgc2::chassis_hold::ServerOptions options;
-options.socket_path = "/tmp/my-chassis.sock";
-options.target_id = "my-chassis";
-options.robot_ids = {"robot-1"};
-xgc2::chassis_hold::HoldServer hold(std::move(options));
-// Native owner: hold.control_tick(zero_output, context), then gate commands
-// with hold.held(). Stop that owner before destroying the server.
+#include <xgc2/chassis_hold/service.hpp>
+using namespace xgc2::chassis_hold;
+
+DomainOptions options;                     // boot_held, linear_eps, angular_eps, stopped_dwell, instance_id, clock
+options.clock = [] { return ros::Time::now().toNSec(); };   // the clock of the receipt times passed to admit()
+Domain domain(options);
+domain.add("ugv-1", /*feedback=*/true);    // a dynamic roster: add() and remove() at any time
+
+struct DeviceZero : ZeroSink {             // the host's device output
+  bool write_zero(const std::string &robot_id, std::string &error) override;   // false + reason on failure
+} sink;
+
+// Command callback: drop commands of a held robot, and commands received before the last release.
+if (!domain.admit("ugv-1", event.getReceiptTime().toNSec())) return;
+
+// Control loop, on the thread that owns device output, after the command callbacks:
+domain.tick(sink);                                          // zero for every held robot, every tick
+domain.observe("ugv-1", linear_speed, angular_speed, stamp_ns);   // optional trusted velocity feedback
+
+// Remote surface; transports call this, or call_async to reply later without blocking their IO thread:
+Service service(domain);                   // reply_wait, max_ids, max_body_bytes
+ServiceReply reply = service.call("Engage", R"({"robot_ids":["ugv-1"]})");
+service.call_async("Release", body, deadline, [](ServiceReply reply) { /* send it */ });
 ```
 
-The state-machine runtime starts on the first valid native mutation. Entry
-callbacks maintain a compact, allocation-free gate view; state transitions may
-allocate in the runtime's bounded diagnostics. Runtime failures close every
-gate until restart. All gates and native writes must share one native owner
-or the host's synchronization. RPC replies remain retained until native work
-ends, including after caller cancellation.
-The standalone IO owner sleeps in XRPC's event loop; native completion uses
-its coalesced, allocation-free wakeup. There is no periodic completion polling.
+`Service` runs one small thread of its own that completes pending `Engage` replies; it never calls back on the
+tick thread. Simulators stamp command enqueue time with `domain.now()`. The host rules (clock, tick ordering,
+shutdown order) are in section 4 of the contract.
 
-Build with CMake, a C++20 compiler, the installed XRPC and state-machine SDKs, and its JSON dependency. JsonCpp >=1.7.4 is used only by the independent test peer. The State and Server public APIs require only C++17 and have no XRPC or JSON headers.
-The Rpc integration API uses the C++20 XRPC SDK.
+## Build and test
+
+C++17, CMake 3.10 or newer, nlohmann-json 2.1.1 or newer (Ubuntu 18.04 `nlohmann-json-dev`, later
+`nlohmann-json3-dev`). Supported: Ubuntu 18.04, 20.04, 22.04 and 24.04 with g++ 7.5 or newer, amd64 and arm64.
+The commands avoid `cmake -S/-B`, `--parallel` and `ctest --test-dir`, which Ubuntu 18.04's CMake 3.10 lacks.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-ctest --test-dir build --output-on-failure
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DXGC2_CHASSIS_HOLD_WERROR=ON
+cmake --build . -- -j3
+ctest --output-on-failure
 ```
 
-The protocol is defined in [chassis-hold-v1](contracts/chassis-hold-v1.md).
+The tests are plain programs (`test/check.hpp`): the domain rules (`domain_test`), the JSON service including
+its closed schemas and limits (`service_test`) and threads against one domain and one service
+(`concurrency_test`). `.xgc2/scripts/run-sanitizers.sh` runs all of them under ThreadSanitizer and under
+AddressSanitizer plus UndefinedBehaviorSanitizer (`-DCMAKE_CXX_FLAGS=-fsanitize=...`). The programs in `test/`
+also build as a separate project against an installed package (`mkdir b && cd b && cmake ../test`); CI does this
+after installing the packages it built.
+
+## Packages
+
+`libxgc2-chassis-hold1` (runtime) and `libxgc2-chassis-hold-dev` (headers, CMake package `XgcChassisHold`,
+contracts) for bionic, focal, jammy and noble, built by `.xgc2/scripts/build_debs.sh`. The product metadata is
+`.xgc2/product.yml`.
