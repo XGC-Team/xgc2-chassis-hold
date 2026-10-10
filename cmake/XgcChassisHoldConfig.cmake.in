@@ -1,17 +1,6 @@
 @PACKAGE_INIT@
-include(CMakeFindDependencyMacro)
-include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldStateTargets.cmake")
-set(XgcChassisHold_State_FOUND TRUE)
-if(NOT XgcChassisHold_FIND_COMPONENTS)
-  set(XgcChassisHold_FIND_COMPONENTS State Rpc Server)
-endif()
-if("Rpc" IN_LIST XgcChassisHold_FIND_COMPONENTS)
-  find_dependency(XgcXrpc 0.1.0 CONFIG COMPONENTS json_http)
-  include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldRpcTargets.cmake")
-  set(XgcChassisHold_Rpc_FOUND TRUE)
-endif()
-if("Server" IN_LIST XgcChassisHold_FIND_COMPONENTS)
-  include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldServerTargets.cmake")
-  set(XgcChassisHold_Server_FOUND TRUE)
-endif()
+
+# Components: core (domain and JSON service).
+include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldCoreTargets.cmake")
+set(XgcChassisHold_core_FOUND TRUE)
 check_required_components(XgcChassisHold)

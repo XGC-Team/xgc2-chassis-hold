@@ -1,42 +1,43 @@
-cmake_minimum_required(VERSION 3.16)
-project(XgcChassisHold VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.10)
+project(XgcChassisHold VERSION 1.0.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 include(CTest)
-find_package(xgc2_state_machine 0.1.3 CONFIG REQUIRED)
-find_package(XgcXrpc 0.1.0 CONFIG REQUIRED COMPONENTS json_http)
+
+option(XGC2_CHASSIS_HOLD_WERROR "Treat compiler warnings as errors" OFF)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
-foreach(component State Rpc Server)
-  string(TOLOWER "${component}" source)
-  if(component STREQUAL "Rpc")
-    set(source rpc_handler)
-  endif()
-  add_library(xgc2_chassis_hold_${component} SHARED src/${source}.cpp)
-  add_library(XgcChassisHold::${component} ALIAS xgc2_chassis_hold_${component})
-  set_target_properties(xgc2_chassis_hold_${component} PROPERTIES EXPORT_NAME ${component}
-    OUTPUT_NAME xgc2_chassis_hold_${source} VERSION ${PROJECT_VERSION} SOVERSION 0 INSTALL_RPATH "$ORIGIN")
-  target_compile_features(xgc2_chassis_hold_${component} PUBLIC cxx_std_17 PRIVATE cxx_std_20)
-  target_compile_options(xgc2_chassis_hold_${component} PRIVATE -Wall -Wextra -Wpedantic -Werror)
-  target_include_directories(xgc2_chassis_hold_${component} PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-  install(TARGETS xgc2_chassis_hold_${component} EXPORT XgcChassisHold${component}Targets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  install(EXPORT XgcChassisHold${component}Targets NAMESPACE XgcChassisHold::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcChassisHold)
-endforeach()
-target_link_libraries(xgc2_chassis_hold_State PRIVATE xgc2_state_machine::state_machine Threads::Threads)
-target_link_libraries(xgc2_chassis_hold_Rpc PUBLIC XgcChassisHold::State XgcXrpc::json_http)
-target_link_libraries(xgc2_chassis_hold_Server PUBLIC XgcChassisHold::State PRIVATE XgcChassisHold::Rpc Threads::Threads)
+
+# Component core: the domain. Needs the C++ standard library only.
+add_library(xgc2_chassis_hold SHARED src/domain.cpp)
+add_library(XgcChassisHold::core ALIAS xgc2_chassis_hold)
+set_target_properties(xgc2_chassis_hold PROPERTIES EXPORT_NAME core VERSION ${PROJECT_VERSION} SOVERSION 1)
+target_include_directories(xgc2_chassis_hold PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(xgc2_chassis_hold PRIVATE Threads::Threads)
+target_compile_options(xgc2_chassis_hold PRIVATE -Wall -Wextra -Wpedantic)
+if(XGC2_CHASSIS_HOLD_WERROR)
+  target_compile_options(xgc2_chassis_hold PRIVATE -Werror)
+endif()
+install(TARGETS xgc2_chassis_hold EXPORT XgcChassisHoldCoreTargets
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(EXPORT XgcChassisHoldCoreTargets NAMESPACE XgcChassisHold:: FILE XgcChassisHoldCoreTargets.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcChassisHold)
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY contracts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/xgc2-chassis-hold/contracts)
-configure_package_config_file(cmake/XgcChassisHoldConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfig.cmake
+configure_package_config_file(cmake/XgcChassisHoldConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfig.cmake
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcChassisHold)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfigVersion.cmake
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfigVersion.cmake
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcChassisHold)
+
 if(BUILD_TESTING)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(HoldJsonCpp REQUIRED IMPORTED_TARGET jsoncpp>=1.7.4)
   add_subdirectory(test)
 endif()
