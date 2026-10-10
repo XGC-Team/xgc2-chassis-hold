@@ -10,8 +10,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
   find_package(Threads REQUIRED)
   find_package(XgcNlohmannJson REQUIRED)
-  find_package(XgcChassisHold 1.0.0 CONFIG REQUIRED COMPONENTS core udp)
+  find_package(XgcChassisHold 0.2.0 CONFIG REQUIRED COMPONENTS core udp)
   find_package(XgcXrpc 0.1.0 CONFIG REQUIRED COMPONENTS udp)
+  find_program(XGC2_HOLD_CLI xgc2-hold)
+  if(NOT XGC2_HOLD_CLI)
+    message(FATAL_ERROR "xgc2-hold was not found: install libxgc2-chassis-hold1")
+  endif()
 endif()
 
 function(chassis_hold_test name)
@@ -29,7 +33,7 @@ chassis_hold_test(domain_test)
 chassis_hold_test(service_test)
 chassis_hold_test(concurrency_test)
 
-# The udp.v1 endpoint with the xrpc client; $TMPDIR holds the key files of the tests.
+# The udp.v1 endpoint with the xrpc client, and the xgc2-hold tool; $TMPDIR holds the key files of the tests.
 if(TARGET XgcChassisHold::udp)
   add_executable(chassis_hold_udp_endpoint_test udp_endpoint_test.cpp)
   target_link_libraries(chassis_hold_udp_endpoint_test PRIVATE XgcChassisHold::udp XgcXrpc::udp
@@ -40,5 +44,21 @@ if(TARGET XgcChassisHold::udp)
   endif()
   add_test(NAME chassis_hold_udp_endpoint_test COMMAND chassis_hold_udp_endpoint_test)
   set_tests_properties(chassis_hold_udp_endpoint_test PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
+
+  if(TARGET xgc2-hold)
+    set(_xgc2_hold_cli $<TARGET_FILE:xgc2-hold>)
+  else()
+    set(_xgc2_hold_cli ${XGC2_HOLD_CLI})
+  endif()
+  add_executable(chassis_hold_cli_test hold_cli_test.cpp)
+  target_link_libraries(chassis_hold_cli_test PRIVATE XgcChassisHold::udp XgcXrpc::udp
+    nlohmann_json::nlohmann_json Threads::Threads)
+  target_compile_options(chassis_hold_cli_test PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(chassis_hold_cli_test PRIVATE -Werror)
+  endif()
+  add_test(NAME chassis_hold_cli_test COMMAND chassis_hold_cli_test ${_xgc2_hold_cli})
+  set_tests_properties(chassis_hold_cli_test PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
 endif()

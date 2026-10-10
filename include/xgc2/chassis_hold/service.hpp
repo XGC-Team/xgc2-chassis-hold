@@ -1,5 +1,5 @@
 #pragma once
-// Transport-neutral JSON surface of the chassis HOLD domain (contracts/chassis-hold-v2.md, section 3). The udp.v1
+// Transport-neutral JSON surface of the chassis HOLD domain (contracts/chassis-hold.md, section 2). The udp.v1
 // endpoint and the http.v1 world hosts translate their requests to Service::call and its reply back to their
 // wire format; the domain semantics live in Domain.
 #include <xgc2/chassis_hold/domain.hpp>
@@ -11,7 +11,7 @@
 
 namespace xgc2::chassis_hold {
 
-inline constexpr const char *service_name = "xgc2.chassis.hold.v2";
+inline constexpr const char *service_name = "xgc2.chassis.hold";
 
 // Reply status. The values are the udp.v1 status codes (xrpc.md 5.3); http.v1 hosts map the names with their
 // usual table. Errors carry the body {"code":"<name>","message":"..."}.

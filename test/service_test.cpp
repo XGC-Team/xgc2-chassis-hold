@@ -506,7 +506,7 @@ TEST(requests_are_closed_schemas) {
 TEST(unknown_methods_are_not_found) {
   Domain domain;
   Service service(domain);
-  for (const char *method : {"", "describe", "Describe ", "Hold", "xgc2.chassis.hold.v2/Describe"}) {
+  for (const char *method : {"", "describe", "Describe ", "Hold", "xgc2.chassis.hold/Describe"}) {
     const ServiceReply reply = service.call(method, "{}");
     CHECK_EQ(reply.status, Status::not_found);
     CHECK_EQ(body_of(reply)["code"].get<std::string>(), "not_found");

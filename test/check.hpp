@@ -21,6 +21,11 @@ inline std::vector<Case> &cases() {
   static std::vector<Case> all;
   return all;
 }
+// Command line arguments of the test program (without the program name).
+inline std::vector<std::string> &arguments() {
+  static std::vector<std::string> all;
+  return all;
+}
 inline std::atomic<int> &failures() {
   static std::atomic<int> count{0};
   return count;
@@ -113,5 +118,8 @@ inline int run_all() {
     }                                                                               \
   } while (0)
 
-#define TEST_MAIN() \
-  int main() { return test::run_all(); }
+#define TEST_MAIN()                                                       \
+  int main(int argc, char **argv) {                                      \
+    test::arguments().assign(argv + (argc > 0 ? 1 : 0), argv + argc);    \
+    return test::run_all();                                              \
+  }

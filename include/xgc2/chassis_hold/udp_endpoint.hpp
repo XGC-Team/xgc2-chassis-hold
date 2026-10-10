@@ -1,5 +1,5 @@
 #pragma once
-// The udp.v1 binding of the chassis HOLD service (contracts/chassis-hold-v2.md, section 3.1): what a chassis driver
+// The udp.v1 binding of the chassis HOLD service (contracts/chassis-hold.md, section 3.1): what a chassis driver
 // links to be reachable from the LAN. No xrpc type appears in this header.
 #include <xgc2/chassis_hold/service.hpp>
 
@@ -21,7 +21,7 @@ struct UdpEndpointOptions {
   std::string key_file = "/etc/xgc2/chassis-hold.key";
 };
 
-// Serves Describe, State, Engage and Release of a Service as the udp.v1 methods xgc2.chassis.hold.v2/<Method>:
+// Serves Describe, State, Engage and Release of a Service as the udp.v1 methods xgc2.chassis.hold/<Method>:
 // one UDP socket and one I/O thread of the udp.v1 server, every datagram authenticated with the HMAC key of its
 // key_id. Replies to Engage are completed from the service's thread, so the I/O thread never waits for the native
 // tick. The service, and with it the domain, must outlive the endpoint; destroy the endpoint first.

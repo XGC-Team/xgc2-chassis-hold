@@ -1,5 +1,5 @@
 #pragma once
-// Chassis HOLD domain (contracts/chassis-hold-v2.md). Plain C++17: no transport, no ROS, no JSON.
+// Chassis HOLD domain (contracts/chassis-hold.md). Plain C++17: no transport, no ROS, no JSON.
 //
 // HOLD stops one robot's chassis from executing motion commands until it is explicitly released. The domain
 // keeps the per-robot state; the host feeds it commands (admit), runs the native tick on the thread that owns

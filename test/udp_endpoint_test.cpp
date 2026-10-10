@@ -170,9 +170,9 @@ TEST(bad_requests_get_error_statuses) {
   const udp::Response nope = rig.client.call(rig.endpoint_text(), key_id, unknown_method, "{}",
                                              std::chrono::steady_clock::now() + seconds(2));
   CHECK(answered(nope, udp::Status::NotFound));
-  const udp::Response old_version = rig.client.call(rig.endpoint_text(), key_id, "xgc2.chassis.hold.v1/State", "{}",
-                                                    std::chrono::steady_clock::now() + seconds(2));
-  CHECK(answered(old_version, udp::Status::NotFound));
+  const udp::Response other_service = rig.client.call(rig.endpoint_text(), key_id, "xgc2.chassis.other/State", "{}",
+                                                      std::chrono::steady_clock::now() + seconds(2));
+  CHECK(answered(other_service, udp::Status::NotFound));
 
   const udp::Response invalid = rig.call("Engage", json::object());
   CHECK(answered(invalid, udp::Status::InvalidArgument));
