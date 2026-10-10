@@ -25,7 +25,8 @@ enum class Outcome { engaged, already_held, released, conflict, not_held, unknow
 const char *to_string(Stage) noexcept;
 const char *to_string(Outcome) noexcept;
 
-// Robot ids match [A-Za-z0-9._:-]{1,128}. Instance ids are 32 lowercase hex digits (128 bits).
+// Robot ids match [A-Za-z0-9._:-]{1,128}. Instance ids are 32 lowercase hex digits (128 bits); the all-zero
+// value is only a format-valid id (a domain refuses it, transports use it for "no instance").
 bool valid_robot_id(const std::string &) noexcept;
 bool valid_instance_id(const std::string &) noexcept;
 
@@ -38,7 +39,9 @@ struct DomainOptions {
   double linear_eps = 0.02;   // m/s
   double angular_eps = 0.05;  // rad/s
   std::chrono::milliseconds stopped_dwell{300};
-  // Empty: random 128-bit id. Hosts that already own an instance id (their transport server) pass it here.
+  // 32 lowercase hex digits, not all zero. Empty: a random 128-bit id. A host whose transport already has an
+  // instance id (the xrpc server of a world host) passes it here, so that the transport fence and the domain
+  // agree; UdpEndpoint does the reverse and gives its server the id of the domain.
   std::string instance_id;
   // Empty: std::chrono::steady_clock. Hosts that stamp command receipt with another clock (a ROS driver using
   // MessageEvent::getReceiptTime() passes ros::Time::now()) must give the domain that same clock, otherwise the

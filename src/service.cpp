@@ -487,6 +487,8 @@ struct Service::Impl {
 Service::Service(Domain &domain, ServiceOptions options) : impl_(std::make_unique<Impl>(domain, std::move(options))) {}
 Service::~Service() = default;
 
+const std::string &Service::instance_id() const noexcept { return impl_->domain.instance_id(); }
+
 void Service::call_async(const std::string &method, const std::string &body, Clock::time_point deadline,
                          Callback callback) {
   impl_->dispatch(method, body, deadline, callback);

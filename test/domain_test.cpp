@@ -612,6 +612,9 @@ TEST(options_and_identity) {
   DomainOptions bad_instance_id;
   bad_instance_id.instance_id = "not-hex";
   CHECK(throws(bad_instance_id));
+  DomainOptions zero_instance_id;
+  zero_instance_id.instance_id = std::string(32, '0');
+  CHECK(throws(zero_instance_id));
   DomainOptions negative;
   negative.linear_eps = -1;
   CHECK(throws(negative));

@@ -114,8 +114,8 @@ struct Domain::Impl {
       options.clock = steady_now;
     if (options.instance_id.empty())
       options.instance_id = random_instance_id();
-    else if (!valid_instance_id(options.instance_id))
-      throw std::invalid_argument("instance_id must be 32 lowercase hex digits");
+    else if (!valid_instance_id(options.instance_id) || options.instance_id == std::string(32, '0'))
+      throw std::invalid_argument("instance_id must be 32 lowercase hex digits and not zero");
     if (!(options.linear_eps >= 0) || !(options.angular_eps >= 0) || options.stopped_dwell.count() < 0 ||
         options.stopped_dwell > std::chrono::hours(1))
       throw std::invalid_argument("stopped thresholds must be between 0 and 1 hour");

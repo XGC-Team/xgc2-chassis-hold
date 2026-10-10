@@ -83,6 +83,7 @@ TEST(describe_lists_roster_feedback_and_capabilities) {
   json j = body_of(reply);
   CHECK(only_keys(j, {"instance", "robots", "feedback", "capabilities"}));
   CHECK_EQ(j["instance"].get<std::string>(), domain.instance_id());
+  CHECK_EQ(service.instance_id(), domain.instance_id());
   REQUIRE(j["robots"].size() == 2);
   CHECK_EQ(j["robots"][0].get<std::string>(), "a");
   CHECK_EQ(j["robots"][1].get<std::string>(), "b");

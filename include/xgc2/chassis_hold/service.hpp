@@ -45,6 +45,9 @@ public:
   Service(const Service &) = delete;
   Service &operator=(const Service &) = delete;
 
+  // The instance id of the domain: what transports put in their server identity.
+  const std::string &instance_id() const noexcept;
+
   // method is one of Describe, State, Engage, Release (not found otherwise); body is the request JSON (an empty
   // body is {}). Engage blocks the calling thread for at most reply_wait; do not call it from the tick thread.
   ServiceReply call(const std::string &method, const std::string &body,
