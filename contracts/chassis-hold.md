@@ -1,17 +1,17 @@
-# Chassis HOLD v2
+# Chassis HOLD
 
 HOLD stops one robot's chassis from executing motion commands until it is explicitly released. It is not a
 world pause, not an entity disable and not a reset: other robots, the simulation clock and sensors keep running.
 
-This is the normative contract of `xgc2-chassis-hold` 1.x: the domain library, the transport-neutral JSON
-service and the bindings the hosts expose. It replaces chassis-hold-v1 completely (no v1 routes, sockets,
-revision-gated engage or state-machine regions remain).
+This is the normative contract of `xgc2-chassis-hold`: the domain library, the transport-neutral JSON service, the
+udp.v1 endpoint for chassis drivers and the `xgc2-hold` command line tool. It replaces the Unix-socket HTTP
+routes, the revision-gated engage and the state-machine regions of 0.1.x; none of them remains.
 
 | Host | Device | Transport | Domain runs in |
 | --- | --- | --- | --- |
 | Wheeltec, AgileX driver | serial / CAN, bound to the robot | `udp.v1` server inside the driver | the driver process |
-| Gazebo world | simulated models | routes on the world host's `http.v1` Unix server | gzserver + world plugin |
-| xsim world | simulated entities | routes on xsim's management `http.v1` server | the xsim process |
+| Gazebo world | simulated models | `POST /v1/call/xgc2.chassis.hold/<Method>` on the world host's `http.v1` Unix server | gzserver + world plugin |
+| xsim world | simulated entities | the same, on xsim's management `http.v1` server | the xsim process |
 
 HOLD needs no agent link, session or workflow. A physical robot is reachable as long as its driver runs and the
 LAN delivers datagrams.
@@ -23,8 +23,9 @@ transport, no ROS and no JSON; every operation is thread safe.
 
 ### 1.1 State
 
-Per host instance: `instance` (32 lowercase hex digits, random 128 bits at start, a new value on every restart;
-a host that already owns an instance id for its transport passes the same one).
+Per host instance: `instance` (32 lowercase hex digits, not all zero; random 128 bits at start, a new value on
+every restart). A host whose transport already has an instance id gives it to the domain, and the udp.v1
+endpoint gives the id of the domain to its server, so that transport and domain have one identity.
 
 Per robot:
 
@@ -102,8 +103,9 @@ was created, for ordering only.
 
 ## 2. Service
 
-`Service::call(method, json_body) -> {status, json_body}` is the whole remote surface. Both bindings use it; it
-knows nothing about transports, keys or sockets. Bodies are UTF-8 JSON objects (an empty body is `{}`).
+`Service::call(method, json_body) -> {status, json_body}` is the whole remote surface. Every binding uses it; it
+knows nothing about transports, keys or sockets. The method names are the bare `Describe`, `State`, `Engage` and
+`Release`; a binding addresses them as `xgc2.chassis.hold/<Method>`. Bodies are UTF-8 JSON objects (an empty body is `{}`).
 Requests are closed schemas: unknown or repeated fields, wrong types, duplicate or invalid robot ids and
 numbers that are not unsigned integers are `invalid_argument`. A rejected request changes nothing.
 
@@ -153,22 +155,55 @@ Release {"expected_instance":"3f1c...","changes":[{"robot_id":"ugv-1","expected_
 
 ### 3.1 `udp.v1` (physical drivers)
 
-The driver serves the four methods as `xgc2.chassis.hold.v2/Describe`, `/State`, `/Engage` and `/Release` on a
-`udp.v1` server bound to the management interface, default port 19530. The server authenticates every datagram
-with the robot's HMAC key; the key file defaults to `/etc/xgc2/chassis-hold.key` (one line, `<key_id> <base64
-32-byte key>`, mode 0600, installed by the robot setup). A driver refuses to start the server without a key and
-exits (`hold_required` defaults to true; with `hold_required=false` the driver runs and reports HOLD as
-unavailable in its diagnostics). The transport provides authentication, the deadline, at-most-once execution
-inside its reply-cache window and rate limiting; replay beyond the window is made harmless by the revision
-compare and set. `Release` is fenced on the `instance` of the HOLD bodies (section 1.1).
+`UdpEndpoint` serves the four methods as `xgc2.chassis.hold/Describe`, `/State`, `/Engage` and `/Release` on a
+`udp.v1` server bound to the management interface, default port 19530. Every datagram is authenticated with the
+HMAC key of its key id; the key file defaults to `/etc/xgc2/chassis-hold.key` (one `<key_id> <base64 of 32
+bytes>` per line, `#` comments, mode 0600, installed by the robot setup). The endpoint refuses to start, by
+throwing, when the key file is missing, malformed or holds no key, and when the socket cannot be bound; a driver
+that requires HOLD (`hold_required`, default true) exits then, with `hold_required=false` it runs and reports
+HOLD as unavailable in its diagnostics.
+
+The server instance of the transport is the instance of the domain: the id in every reply header, the id a
+caller pins and the `instance` in the bodies are one value. `Release` is fenced on it in the body and may be
+pinned in the header as well. The transport provides authentication, the deadline, at-most-once execution inside
+its reply cache (120 s, 1024 replies) and a rate limit per source address (50 requests per second, burst 100);
+a replay beyond the cache is made harmless by the revision compare and set. A reply larger than one datagram
+(1200 bytes) is replaced by `resource_exhausted`: the request had its effect, and the caller reads `State` for
+fewer robots at a time. The replies for one robot always fit.
 
 ### 3.2 `http.v1` (world hosts)
 
-One endpoint per world, on the host's existing `http.v1` Unix server: `GET /v2/chassis/describe`,
-`GET|POST /v2/chassis/state`, `POST /v2/chassis/engage`, `POST /v2/chassis/release`; `GET` routes call the
-method with `{}`. Status mapping: `ok` 200, `invalid_argument` 400, `not_found` 404, `internal` 500. Simulated
-robots register their entity id when their model binds and are removed when it unbinds; the HOLD state of an
-unbound id is kept, so a re-created model starts held. HOLD applies while the world is paused.
+A world host serves the methods on its existing `http.v1` Unix server by the generic method addressing:
+`POST /v1/call/xgc2.chassis.hold/Describe`, `/State`, `/Engage` and `/Release` with the JSON body of section 2;
+the reply body is the JSON result. Status mapping: `ok` 200, `invalid_argument` 400, `not_found` 404, `internal`
+500, with the error object of section 2 as the body. The host lists the capability in its describe facts as
+`{"capabilities":[{"name":"xgc2.chassis.hold","entities":["<id>",...]}]}`, the ids being the ones of
+`Domain::describe()`, so that a caller can find the host that serves a given robot. Simulated robots register
+their entity id when their model binds and are removed when it unbinds; the HOLD state of an unbound id is kept,
+so a re-created model starts held. HOLD applies while the world is paused.
+
+### 3.3 `xgc2-hold`
+
+```
+xgc2-hold [--endpoint HOST:PORT] [--key-file PATH] [--key-id N] [--instance HEX] [--timeout-ms N] <command>
+  describe
+  state   [--robot ID]...
+  engage  --robot ID... | --all
+  release --robot ID[=REVISION]...
+```
+
+A client of the udp.v1 endpoint for tests and for the person at the robot. The endpoint defaults to
+`127.0.0.1:19530` (a name is resolved once, IPv4 first), the key file to `/etc/xgc2/chassis-hold.key`, the key id
+to the key of a file that holds exactly one, the timeout to 2000 ms. `--instance` pins the call to an instance
+of the host and, for `release`, is the fenced instance. A `release` that names a robot without `=REVISION` (or no
+`--instance`) first reads `State` and uses what it reported; with both given it makes the one call.
+
+Each run prints one JSON object: `disposition` (`response_received`, `outcome_unknown`, `not_sent`), `status`,
+`instance` of the host that answered, `attempts`, and the `reply` or a `message`. The exit code follows the
+disposition: 0 a reply was received and the request did what it asked (every robot engaged, or released), 1 a
+reply was received and it is an error status or reports a robot that was not engaged or released, 2 the outcome is
+unknown (a request was sent and no valid reply arrived, including a pin on another instance), 3 nothing was sent,
+64 a usage error, 78 a key file or an address that cannot be used.
 
 ## 4. Host rules
 
@@ -178,7 +213,7 @@ unbound id is kept, so a re-created model starts held. HOLD applies while the wo
 3. Run `tick` once per control cycle, after the command callbacks, on the thread that owns device output; the
    sink writes a real zero command and reports failure honestly.
 4. Declare feedback only when the samples are trusted, and report them with the time they were taken.
-5. Stop ticking and destroy the service before the domain.
+5. Stop ticking, destroy the endpoint, then the service, then the domain.
 
 ## 5. What HOLD does not promise
 
