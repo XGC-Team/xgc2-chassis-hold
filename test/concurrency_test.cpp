@@ -17,36 +17,13 @@
 using namespace xgc2::chassis_hold;
 using json = nlohmann::json;
 using fixtures::Sink;
+using fixtures::TickThread;
 using Clock = Service::Clock;
 using std::chrono::microseconds;
 using std::chrono::milliseconds;
 using std::chrono::seconds;
 
 namespace {
-
-// The host's native thread: ticks the domain until stopped.
-class TickThread {
-public:
-  TickThread(Domain &domain, Sink &sink, std::function<void()> extra = nullptr)
-      : thread_([this, &domain, &sink, extra] {
-          while (running_) {
-            domain.tick(sink);
-            if (extra)
-              extra();
-            std::this_thread::sleep_for(microseconds(150));
-          }
-        }) {}
-  ~TickThread() { stop(); }
-  void stop() {
-    running_ = false;
-    if (thread_.joinable())
-      thread_.join();
-  }
-
-private:
-  std::atomic<bool> running_{true};
-  std::thread thread_;
-};
 
 bool wait_until(const std::function<bool()> &condition, milliseconds timeout) {
   const auto end = Clock::now() + timeout;

@@ -10,7 +10,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
   find_package(Threads REQUIRED)
   find_package(XgcNlohmannJson REQUIRED)
-  find_package(XgcChassisHold 1.0.0 CONFIG REQUIRED COMPONENTS core)
+  find_package(XgcChassisHold 1.0.0 CONFIG REQUIRED COMPONENTS core udp)
+  find_package(XgcXrpc 0.1.0 CONFIG REQUIRED COMPONENTS udp)
 endif()
 
 function(chassis_hold_test name)
@@ -27,3 +28,17 @@ endfunction()
 chassis_hold_test(domain_test)
 chassis_hold_test(service_test)
 chassis_hold_test(concurrency_test)
+
+# The udp.v1 endpoint with the xrpc client; $TMPDIR holds the key files of the tests.
+if(TARGET XgcChassisHold::udp)
+  add_executable(chassis_hold_udp_endpoint_test udp_endpoint_test.cpp)
+  target_link_libraries(chassis_hold_udp_endpoint_test PRIVATE XgcChassisHold::udp XgcXrpc::udp
+    nlohmann_json::nlohmann_json Threads::Threads)
+  target_compile_options(chassis_hold_udp_endpoint_test PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(chassis_hold_udp_endpoint_test PRIVATE -Werror)
+  endif()
+  add_test(NAME chassis_hold_udp_endpoint_test COMMAND chassis_hold_udp_endpoint_test)
+  set_tests_properties(chassis_hold_udp_endpoint_test PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
+endif()

@@ -1,6 +1,10 @@
 @PACKAGE_INIT@
 
-# Components: core (domain and JSON service).
+# Components: core (domain and JSON service) and udp (udp.v1 endpoint, present when the package was built with it).
 include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldCoreTargets.cmake")
 set(XgcChassisHold_core_FOUND TRUE)
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldUdpTargets.cmake")
+  include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldUdpTargets.cmake")
+  set(XgcChassisHold_udp_FOUND TRUE)
+endif()
 check_required_components(XgcChassisHold)

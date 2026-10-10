@@ -3,12 +3,14 @@
 #include <xgc2/chassis_hold/domain.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace fixtures {
 
@@ -71,6 +73,30 @@ private:
   std::mutex mutex;
   std::map<std::string, int> counts;
   std::set<std::string> failing_ids;
+};
+
+// The host's native thread: ticks the domain until stopped.
+class TickThread {
+public:
+  TickThread(xgc2::chassis_hold::Domain &domain, Sink &sink, std::function<void()> extra = nullptr)
+      : thread_([this, &domain, &sink, extra] {
+          while (running_) {
+            domain.tick(sink);
+            if (extra)
+              extra();
+            std::this_thread::sleep_for(std::chrono::microseconds(150));
+          }
+        }) {}
+  ~TickThread() { stop(); }
+  void stop() {
+    running_ = false;
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+private:
+  std::atomic<bool> running_{true};
+  std::thread thread_;
 };
 
 }  // namespace fixtures
