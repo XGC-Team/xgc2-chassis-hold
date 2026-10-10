@@ -2,6 +2,8 @@
 # Build, test and package against the installed toolchain. Outputs are never overwritten.
 # Usage: build_debs.sh <fresh work directory> <output directory>
 # PACKAGE_DISTRIBUTION names the distribution the packages are for (default: this system's codename).
+# The XRPC udp component is found through CMAKE_PREFIX_PATH when it is not installed system-wide; the libraries of
+# such a prefix are listed in XGC2_SHLIBDEPS_PATH (colon separated) so that dpkg-shlibdeps can read them.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$root" show -s --format=%ct HEAD)}"
@@ -31,7 +33,9 @@ for package in "$runtime_package" "$dev_package"; do
   test ! -e "$out/${package}_${version}_${arch}.deb"
 done
 
-cmake_args=("-DCMAKE_BUILD_TYPE=RelWithDebInfo" "-DCMAKE_INSTALL_PREFIX=/usr" "-DCMAKE_INSTALL_LIBDIR=lib/$multiarch")
+# The libraries go to the system library directory: no RPATH in the installed files.
+cmake_args=("-DCMAKE_BUILD_TYPE=RelWithDebInfo" "-DCMAKE_INSTALL_PREFIX=/usr" "-DCMAKE_INSTALL_LIBDIR=lib/$multiarch"
+  "-DCMAKE_SKIP_INSTALL_RPATH=ON")
 # Warnings are errors only with the compiler the code is verified with in CI; newer ones report on their own.
 if [[ "$distribution" == focal ]]; then
   cmake_args+=("-DXGC2_CHASSIS_HOLD_WERROR=ON")
@@ -45,7 +49,8 @@ DESTDIR="$work/stage" cmake --build "$work/build" --target install
 
 runtime="$work/runtime"
 dev="$work/dev"
-mkdir -p "$runtime/DEBIAN" "$runtime/usr/lib/$multiarch" "$dev/DEBIAN" "$dev/usr/lib/$multiarch"
+mkdir -p "$runtime/DEBIAN" "$runtime/usr/lib/$multiarch" "$runtime/usr/bin" "$dev/DEBIAN" "$dev/usr/lib/$multiarch"
+cp -a "$work/stage/usr/bin/xgc2-hold" "$runtime/usr/bin/"
 cp -a "$work/stage/usr/include" "$dev/usr/"
 cp -a "$work/stage/usr/share" "$dev/usr/"
 cp -a "$work/stage/usr/lib/$multiarch/cmake" "$dev/usr/lib/$multiarch/"
@@ -54,14 +59,29 @@ for file in "$work/stage/usr/lib/$multiarch/"*.so*; do
   else cp -a "$file" "$runtime/usr/lib/$multiarch/"; fi
 done
 find "$runtime/usr/lib/$multiarch" -type f -name '*.so.*' -exec strip --strip-unneeded {} +
-printf 'libxgc2_chassis_hold 1 %s (>= %s)\n' "$runtime_package" "$version" > "$runtime/DEBIAN/shlibs"
+strip --strip-unneeded "$runtime/usr/bin/xgc2-hold"
+{
+  printf 'libxgc2_chassis_hold 1 %s (>= %s)\n' "$runtime_package" "$version"
+  printf 'libxgc2_chassis_hold_udp 1 %s (>= %s)\n' "$runtime_package" "$version"
+} > "$runtime/DEBIAN/shlibs"
 mkdir -p "$work/debian"
 printf 'Source: xgc2-chassis-hold\nSection: libs\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n\nPackage: %s\nArchitecture: any\nDescription: Chassis HOLD\n' \
   "$runtime_package" > "$work/debian/control"
 cp "$runtime/DEBIAN/shlibs" "$work/debian/shlibs.local"
+# The XRPC udp runtime package, whether the library came from it or from a private prefix of the build.
+printf 'libxgc2_xrpc_udp 1 libxgc2-xrpc-udp1 (>= 0.1.0)\n' >> "$work/debian/shlibs.local"
+shlibdeps_args=()
+IFS=: read -r -a extra_library_paths <<<"${XGC2_SHLIBDEPS_PATH:-}"
+for path in "${extra_library_paths[@]}"; do
+  if [[ -n "$path" ]]; then
+    shlibdeps_args+=("-l$path")
+  fi
+done
 pushd "$work" >/dev/null
-mapfile -t libraries < <(find "$runtime/usr/lib/$multiarch" -type f -name '*.so.*' | sort)
-depends="$(dpkg-shlibdeps -O -x"$runtime_package" -l"$runtime/usr/lib/$multiarch" "${libraries[@]/#/-e}" | sed -n 's/^shlibs:Depends=//p')"
+mapfile -t objects < <(find "$runtime/usr/lib/$multiarch" -type f -name '*.so.*' | sort)
+objects+=("$runtime/usr/bin/xgc2-hold")
+depends="$(dpkg-shlibdeps -O -x"$runtime_package" -l"$runtime/usr/lib/$multiarch" "${shlibdeps_args[@]}" "${objects[@]/#/-e}" |
+  sed -n 's/^shlibs:Depends=//p')"
 popd >/dev/null
 test -n "$depends"
 cat > "$runtime/DEBIAN/control" <<CONTROL
@@ -73,7 +93,8 @@ Priority: optional
 Maintainer: XGC Team <apt@example.com>
 Depends: $depends
 Description: XGC2 chassis HOLD runtime
- Domain library and transport-neutral JSON service for chassis command gating.
+ Domain library, transport-neutral JSON service and udp.v1 endpoint for chassis
+ command gating, and the xgc2-hold command line client.
 CONTROL
 printf 'activate-noawait ldconfig\n' > "$runtime/DEBIAN/triggers"
 cat > "$dev/DEBIAN/control" <<CONTROL
@@ -85,7 +106,7 @@ Priority: optional
 Maintainer: XGC Team <apt@example.com>
 Depends: $runtime_package (= $version)
 Description: XGC2 chassis HOLD development files
- C++17 headers, CMake package XgcChassisHold (component core) and the HOLD contract.
+ C++17 headers, CMake package XgcChassisHold (components core and udp) and the HOLD contract.
 CONTROL
 for spec in "runtime $runtime_package" "dev $dev_package"; do
   read -r dir package <<<"$spec"

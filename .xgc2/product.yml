@@ -1,9 +1,9 @@
 schema: xgc2.product.v1
 id: libxgc2-chassis-hold-dev
 name: XGC2 Chassis HOLD
-version: 1.0.0-1
+version: 0.2.0-1
 kind: toolchain-apt
-summary: Chassis HOLD domain library and transport-neutral JSON service shared by XGC2 chassis drivers and simulation hosts.
+summary: Chassis HOLD domain library, transport-neutral JSON service, udp.v1 endpoint and xgc2-hold tool shared by XGC2 chassis drivers and simulation hosts.
 apt:
   distribution: bionic,focal,jammy,noble
   install:
@@ -12,28 +12,32 @@ apt:
   - libxgc2-chassis-hold1
   - libxgc2-chassis-hold-dev
   depends:
+  - libxgc2-xrpc-udp1 (>= 0.1.0)
   - libc6
   - libgcc1 | libgcc-s1
   - libstdc++6
 usage:
   install: sudo apt install libxgc2-chassis-hold-dev
   smoke_test: cmake --find-package -DNAME=XgcChassisHold -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++17. find_package(XgcChassisHold CONFIG COMPONENTS core) and link XgcChassisHold::core for the domain and the JSON service. Command-gated completion does not confirm physical rest.
+  notes: C++17. find_package(XgcChassisHold CONFIG COMPONENTS core udp); XgcChassisHold::core is the domain and the JSON service, XgcChassisHold::udp adds the udp.v1 endpoint for chassis drivers. /usr/bin/xgc2-hold is the command line client. Command-gated completion does not confirm physical rest.
 ownership:
   paths:
   - /usr/include/xgc2/chassis_hold
   - /usr/lib/*/libxgc2_chassis_hold*.so*
   - /usr/lib/*/cmake/XgcChassisHold
   - /usr/share/xgc2-chassis-hold/contracts
+  - /usr/bin/xgc2-hold
 release:
   repository: XGC-Team/xgc2-chassis-hold
   ref: main
   workflow: release.yml
   ci_workflow: ci.yml
-  requires: []
-  dependency_policy: {}
+  requires:
+  - xgc2-xrpc
+  dependency_policy:
+    xgc2-xrpc: rebuild
   apt_versions:
-    bionic: 1.0.0-1~bionic
-    focal: 1.0.0-1~focal
-    jammy: 1.0.0-1~jammy
-    noble: 1.0.0-1~noble
+    bionic: 0.2.0-1~bionic
+    focal: 0.2.0-1~focal
+    jammy: 0.2.0-1~jammy
+    noble: 0.2.0-1~noble

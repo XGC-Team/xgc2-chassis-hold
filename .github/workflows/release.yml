@@ -56,6 +56,14 @@ jobs:
           case "$PREPARE_ACTION" in release|compatibility-verify) ;; *) exit 1;; esac
           test -z "$XGC2_DEPENDENCY_SET_DIGEST" || [[ "$XGC2_DEPENDENCY_SET_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           test -z "$XGC2_APT_OVERLAY_URL" || [[ "$XGC2_DEPENDENCY_SET_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+      - name: Read the pinned XRPC revision
+        id: xrpc
+        run: echo "ref=$(tr -d '[:space:]' < .xgc2/xrpc.ref)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: XGC-Team/xgc2-xrpc
+          ref: ${{ steps.xrpc.outputs.ref }}
+          path: _dependencies/xrpc
       - name: Build, test, package and run the tests against the installed packages
         run: |
           mkdir -p .ci
@@ -63,9 +71,10 @@ jobs:
             -e PACKAGE_DISTRIBUTION="${{ matrix.distribution }}" \
             -e XGC2_APT_OVERLAY_URL -e XGC2_DEPENDENCY_SET_DIGEST \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-            -v "$GITHUB_WORKSPACE:/repo:ro" -v "$GITHUB_WORKSPACE/.ci:/repo/.ci" -v "$RUNNER_TEMP:/scratch" \
+            -v "$GITHUB_WORKSPACE:/repo:ro" -v "$GITHUB_WORKSPACE/.ci:/repo/.ci" \
+            -v "$GITHUB_WORKSPACE/_dependencies:/dependencies" -v "$RUNNER_TEMP:/scratch" \
             "${{ matrix.image }}" \
-            bash -lc 'set -euo pipefail; trap "chown -R $HOST_UID:$HOST_GID /repo/.ci /scratch/chassis-hold" EXIT; git config --global --add safe.directory "*"; /repo/.xgc2/scripts/build-ci.sh /scratch/chassis-hold'
+            bash -lc 'set -euo pipefail; trap "chown -R $HOST_UID:$HOST_GID /repo/.ci /dependencies /scratch/chassis-hold" EXIT; git config --global --add safe.directory "*"; /repo/.xgc2/scripts/build-ci.sh /scratch/chassis-hold /dependencies'
       - name: Create strict source-bound build manifest
         run: |
           version="$(awk '/^version:/ {print $2; exit}' .xgc2/product.yml)"
