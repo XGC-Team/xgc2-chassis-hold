@@ -12,7 +12,8 @@ if [[ -n "${XGC2_APT_OVERLAY_URL:-}" ]]; then
   [[ "$XGC2_APT_OVERLAY_URL" =~ ^https://[^[:space:]]+$ ]]
   install -d -m 0755 /etc/apt/keyrings
   curl -fsSL https://xgc2.apt.xiaokang.ink/xgc2-archive-keyring.gpg -o /etc/apt/keyrings/xgc2.gpg
-  printf 'deb [signed-by=/etc/apt/keyrings/xgc2.gpg] %s focal main\n' "${XGC2_APT_OVERLAY_URL%/}" > /etc/apt/sources.list.d/xgc2.list
+  printf 'deb [signed-by=/etc/apt/keyrings/xgc2.gpg] %s focal main\n' \
+    https://xgc2.apt.xiaokang.ink "${XGC2_APT_OVERLAY_URL%/}" > /etc/apt/sources.list.d/xgc2.list
   apt-get update -o Dir::Etc::sourcelist=sources.list.d/xgc2.list -o Dir::Etc::sourceparts=-
   apt-get install -y --no-install-recommends libxgc2-xrpc-dev libxgc2-state-machine-dev
 else
