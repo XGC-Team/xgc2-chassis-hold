@@ -120,7 +120,8 @@ printf 'activate-noawait ldconfig\n' > "$runtime/DEBIAN/triggers"
 dev_depends="$runtime_package (= $version)"
 components="core and udp"
 if [[ "$with_http" == ON ]]; then
-  dev_depends="$dev_depends, libxgc2-xrpc-dev (>= 0.2.0)"
+  xrpc_dev_package=libxgc2-xrpc-dev
+  dev_depends="$dev_depends, $xrpc_dev_package (>= 0.2.0)"
   components="core, udp and http"
 fi
 cat > "$dev/DEBIAN/control" <<CONTROL
