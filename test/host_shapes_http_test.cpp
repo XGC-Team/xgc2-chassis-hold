@@ -208,18 +208,15 @@ struct ModelVelocity : FeedbackSource {
 };
 
 // The world with its physics thread: WorldUpdateBegin callbacks run in every iteration, unless the world is paused.
+// As in Gazebo, disconnecting waits for a callback that is running: the plugin may be destroyed afterwards.
 class GazeboWorld {
 public:
   GazeboWorld() : thread_([this] {
     while (running_) {
       if (!paused_) {
-        std::function<void()> callback;
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          callback = update_begin_;
-        }
-        if (callback)
-          callback();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (update_begin_)
+          update_begin_();
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
