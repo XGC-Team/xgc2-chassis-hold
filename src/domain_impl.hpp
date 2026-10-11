@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 
 namespace xgc2::chassis_hold {
@@ -86,6 +87,7 @@ struct Entry {
   std::atomic<std::uint32_t> gate{0};
   std::atomic<TimeNs> fence{no_fence};  // host-clock time of the last release
   bool started = false;                 // the machine is started: tick thread only
+  std::atomic<bool> pending{false};       // the inbox may need an update
   std::unique_ptr<sm::StateMachine> machine;
 
   // Everything below is guarded by the mutex, which the machine's callbacks take as well.
@@ -137,6 +139,27 @@ struct DomainImpl {
   // Writers: add and remove. Readers: everything else.
   mutable std::shared_mutex roster_mutex;
   std::map<std::string, std::unique_ptr<Entry>> robots;  // never erased: removed ids keep their state
+
+  // Only pending or held entries belong here. Never take an entry/roster lock while holding work_mutex;
+  // callers that need both take the existing roster/entry locks first. No lock crosses a host callback.
+  std::mutex work_mutex;
+  std::map<std::string, Entry *> work;
+  std::thread::id tick_thread;
+  // Scratch storage belongs to the one tick thread; entries are never erased from robots.
+  std::vector<Entry *> tick_entries;
+  struct Target {
+    Target(Entry *entry_in, std::uint64_t binding_in, std::uint64_t revision_in, Stage stage_in, bool faulted_in)
+        : entry(entry_in), binding(binding_in), revision(revision_in), stage(stage_in), faulted(faulted_in) {}
+    Entry *entry;
+    std::uint64_t binding;
+    std::uint64_t revision;
+    Stage stage;
+    bool faulted;
+    bool ok = false;
+    bool reported = false;
+    std::string error;
+  };
+  std::vector<Target> tick_targets;
 
   std::mutex listener_mutex;
   std::vector<std::pair<std::uint64_t, std::shared_ptr<const Domain::Listener>>> listeners;

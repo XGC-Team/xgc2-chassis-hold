@@ -142,14 +142,23 @@ RobotState DomainImpl::view(Entry &entry) const {
 bool DomainImpl::post(Entry &entry, sm::EventId id, sm::EventPayload payload) {
   sm::Event event(id);
   event.payload = std::move(payload);
-  return entry.machine->postEvent(std::move(event)).ok();
+  std::lock_guard<std::mutex> work_lock(work_mutex);
+  if (!entry.machine->postEvent(std::move(event)).ok())
+    return false;
+  entry.pending.store(true, std::memory_order_release);
+  work.try_emplace(entry.id, &entry);
+  return true;
 }
 
 void DomainImpl::fail_closed(Entry &entry, const std::string &why) {
   entry.gate.fetch_or(kBrokenBit, std::memory_order_acq_rel);
-  std::lock_guard<std::mutex> lock(entry.mutex);
-  if (entry.broken.empty())
-    entry.broken = clean_text(why);
+  {
+    std::lock_guard<std::mutex> lock(entry.mutex);
+    if (entry.broken.empty())
+      entry.broken = clean_text(why);
+  }
+  std::lock_guard<std::mutex> work_lock(work_mutex);
+  work.try_emplace(entry.id, &entry);
 }
 
 void DomainImpl::engage_entry(Entry &entry, const std::shared_ptr<Operation> &operation, Item *item) {
@@ -182,6 +191,8 @@ void DomainImpl::engage_ordered(Entry &entry, const std::shared_ptr<Operation> &
 }
 
 bool DomainImpl::drain(Entry &entry) {
+  if (!entry.pending.exchange(false, std::memory_order_acq_rel))
+    return false;
   const auto wrong_thread = [](const sm::Status &status) {
     if (status.code == sm::ErrorCode::kWrongOwnerThread)
       throw std::logic_error("Domain::tick must always run on the same thread");
@@ -218,8 +229,10 @@ bool DomainImpl::drain(Entry &entry) {
     if (result.value.events_taken > 0)
       progressed = true;
     if (result.value.events_remaining == 0)
-      break;
+      return progressed;
   }
+  // The bounded drain left work for the next tick. A concurrent post also keeps pending set.
+  entry.pending.store(true, std::memory_order_release);
   return progressed;
 }
 
@@ -318,6 +331,10 @@ bool detail::DomainImpl::add_robot(const std::string &robot_id, bool feedback, b
     entry.active = true;
     binding = ++entry.binding;
     entry.state.feedback = feedback;
+    // A removed entry can still have queued events; a held or broken entry still needs zero writes.
+    std::lock_guard<std::mutex> work_lock(work_mutex);
+    if (entry.pending.load(std::memory_order_acquire) || entry.gate.load(std::memory_order_acquire) != 0)
+      work.try_emplace(entry.id, &entry);
     // Only a hold has anything to learn about the new device: one the machine applied, or an engage on its way.
     rebind = entry.state.held || (entry.gate.load(std::memory_order_acquire) & ~kBrokenBit) >= kPendingUnit;
     if (entry.state.held) {
@@ -360,6 +377,8 @@ bool Domain::remove(const std::string &robot_id) {
     if (!found->second->active)
       return false;
     found->second->active = false;
+    std::lock_guard<std::mutex> work_lock(impl_->work_mutex);
+    impl_->work.erase(robot_id);
   }
   impl_->notify();  // pending replies stop waiting for a robot that is gone
   return true;
@@ -490,30 +509,32 @@ bool Domain::admit(const std::string &robot_id, TimeNs receipt_time_ns) const {
 }
 
 TickStats Domain::tick(ZeroSink &sink) {
-  std::vector<detail::Entry *> entries;
+  auto &entries = impl_->tick_entries;
   {
-    std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
-    for (const auto &item : impl_->robots)
-      if (impl_->find_active(item.first))
-        entries.push_back(item.second.get());
+    std::lock_guard<std::mutex> work_lock(impl_->work_mutex);
+    const auto thread = std::this_thread::get_id();
+    if (impl_->tick_thread == std::thread::id())
+      impl_->tick_thread = thread;
+    else if (impl_->tick_thread != thread)
+      throw std::logic_error("Domain::tick must always run on the same thread");
+    entries.clear();
+    for (const auto &item : impl_->work)
+      entries.push_back(item.second);
   }
   // The machines apply what arrived since the last tick.
   bool progressed = false;
-  for (detail::Entry *entry : entries)
-    progressed = impl_->drain(*entry) || progressed;
+  for (detail::Entry *entry : entries) {
+    bool active;
+    {
+      std::lock_guard<std::mutex> lock(entry->mutex);
+      active = entry->active;
+    }
+    if (active)
+      progressed = impl_->drain(*entry) || progressed;
+  }
 
-  struct Target {
-    Target(detail::Entry *entry_in, std::uint64_t binding_in, std::uint64_t revision_in, Stage stage_in, bool faulted_in)
-        : entry(entry_in), binding(binding_in), revision(revision_in), stage(stage_in), faulted(faulted_in) {}
-    detail::Entry *entry;
-    std::uint64_t binding;
-    std::uint64_t revision;
-    Stage stage;
-    bool faulted = false;
-    bool ok = false;
-    std::string error;
-  };
-  std::vector<Target> targets;
+  auto &targets = impl_->tick_targets;
+  targets.clear();
   for (detail::Entry *entry : entries) {
     std::lock_guard<std::mutex> lock(entry->mutex);
     if (entry->active && (entry->state.held || !entry->broken.empty()))
@@ -540,28 +561,48 @@ TickStats Domain::tick(ZeroSink &sink) {
 
   // What the writes did is an event of the machine like any other. A confirmation that changes nothing (the zero
   // was already written) is not posted.
-  std::vector<detail::Entry *> reported;
-  for (const auto &target : targets) {
+  for (auto &target : targets) {
     if (target.entry->gate.load(std::memory_order_acquire) & kBrokenBit)
       continue;  // the machine failed: the robot stays held and nothing follows
-    sm::EventPayload payload;
-    payload["binding"] = as_payload(target.binding);
-    payload["revision"] = as_payload(target.revision);
     sm::EventId id = 0;
     if (!target.ok) {
       id = ev::ZeroFailed;
-      payload["error"] = target.error.empty() ? std::string("zero write failed") : target.error;
     } else if (target.stage == Stage::gated && !target.faulted) {
       id = ev::ZeroWritten;
     }
-    if (id != 0 && impl_->post(*target.entry, id, std::move(payload)))
-      reported.push_back(target.entry);
+    if (id != 0) {
+      sm::EventPayload payload;
+      payload["binding"] = as_payload(target.binding);
+      payload["revision"] = as_payload(target.revision);
+      if (!target.ok)
+        payload["error"] = target.error.empty() ? std::string("zero write failed") : target.error;
+      target.reported = impl_->post(*target.entry, id, std::move(payload));
+    }
   }
-  for (detail::Entry *entry : reported)
-    progressed = impl_->drain(*entry) || progressed;
+  for (const auto &target : targets)
+    if (target.reported)
+      progressed = impl_->drain(*target.entry) || progressed;
+  for (detail::Entry *entry : entries) {
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    std::lock_guard<std::mutex> work_lock(impl_->work_mutex);
+    if (!entry->active || (entry->gate.load(std::memory_order_acquire) == 0 &&
+                           !entry->pending.load(std::memory_order_acquire)))
+      impl_->work.erase(entry->id);
+  }
   if (progressed)
     impl_->notify();
   return stats;
+}
+
+void Domain::feedback_targets(std::vector<const std::string *> &robot_ids) const {
+  robot_ids.clear();
+  for (detail::Entry *entry : impl_->tick_entries) {
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    const RobotState &state = entry->state;
+    if (entry->active && state.held && state.feedback && entry->broken.empty() &&
+        (state.stage == Stage::zero_written || state.stage == Stage::stopped))
+      robot_ids.push_back(&entry->id);
+  }
 }
 
 bool Domain::observe(const std::string &robot_id, double linear_speed, double angular_speed, TimeNs stamp_ns) {

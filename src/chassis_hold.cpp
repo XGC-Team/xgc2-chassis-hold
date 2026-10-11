@@ -25,17 +25,16 @@ TickStats ChassisHold::tick() {
   const TickStats stats = domain_.tick(sink_);
   if (feedback_ == nullptr)
     return stats;
-  for (const RobotState &robot : domain_.state().robots) {
-    if (!robot.held || !robot.feedback)
-      continue;
+  domain_.feedback_targets(feedback_robots_);
+  for (const std::string *robot_id : feedback_robots_) {
     Feedback sample;
     try {
-      if (!feedback_->latest(robot.robot_id, sample))
+      if (!feedback_->latest(*robot_id, sample))
         continue;
     } catch (const std::exception &) {
       continue;  // like a failed write: the host's measurement is not available this cycle
     }
-    domain_.observe(robot.robot_id, sample.linear, sample.angular, sample.stamp);
+    domain_.observe(*robot_id, sample.linear, sample.angular, sample.stamp);
   }
   return stats;
 }

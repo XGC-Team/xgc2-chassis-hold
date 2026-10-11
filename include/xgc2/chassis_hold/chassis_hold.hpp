@@ -81,6 +81,7 @@ private:
   FeedbackSource *feedback_;
   Domain domain_;
   Service service_;
+  std::vector<const std::string *> feedback_robots_;  // reused by the tick thread; domain ids never move
 };
 
 }  // namespace xgc2::chassis_hold

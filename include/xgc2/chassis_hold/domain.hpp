@@ -233,6 +233,9 @@ public:
   void remove_listener(std::uint64_t token);
 
 private:
+  friend class ChassisHold;
+  // Tick-thread scratch selection: held robots whose zero is confirmed and whose feedback can count.
+  void feedback_targets(std::vector<const std::string *> &robot_ids) const;
   std::unique_ptr<detail::DomainImpl> impl_;
 };
 
