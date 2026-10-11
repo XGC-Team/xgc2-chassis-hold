@@ -69,6 +69,7 @@ const char *to_string(Outcome outcome) noexcept {
     case Outcome::conflict: return "conflict";
     case Outcome::not_held: return "not_held";
     case Outcome::unknown_robot: return "unknown_robot";
+    case Outcome::pending: return "pending";
     case Outcome::expired: return "expired";
   }
   return "unknown";
@@ -248,6 +249,22 @@ void DomainImpl::wake() noexcept {
 
 bool Pending::done() const { return !operation_ || operation_->unresolved.load(std::memory_order_acquire) == 0; }
 
+std::size_t Pending::withdraw() const {
+  std::size_t withdrawn = 0;
+  if (!operation_)
+    return withdrawn;
+  for (const auto &item : operation_->items) {
+    if (!item->entry || item->ticket == 0)
+      continue;  // not in the roster, or an engage: nothing to take back
+    std::lock_guard<std::mutex> lock(item->entry->mutex);
+    if (item->entry->tickets.count(item->ticket) == 1) {
+      item->entry->resolve(item->ticket, Outcome::expired);
+      ++withdrawn;
+    }
+  }
+  return withdrawn;
+}
+
 std::vector<RobotResult> Pending::results() const {
   std::vector<RobotResult> results;
   if (!operation_)
@@ -384,8 +401,7 @@ Pending Domain::engage_all() {
   return engage(ids);
 }
 
-Pending Domain::release(const std::string &expected_instance, const std::vector<ReleaseChange> &changes,
-                        std::optional<TimeNs> deadline_ns) {
+Pending Domain::release(const std::string &expected_instance, const std::vector<ReleaseChange> &changes) {
   auto operation = std::make_shared<detail::Operation>();
   operation->domain = impl_.get();
   bool needs_tick = false;
@@ -402,18 +418,18 @@ Pending Domain::release(const std::string &expected_instance, const std::vector<
         continue;
       }
       raw->entry = entry;
-      raw->provisional = Outcome::conflict;  // not applied
+      raw->provisional = Outcome::pending;
       std::int64_t ticket = 0;
       {
         std::lock_guard<std::mutex> lock(entry->mutex);
         operation->unresolved.fetch_add(1, std::memory_order_acq_rel);
         ticket = entry->add_ticket(operation, raw);
+        raw->ticket = ticket;
       }
       sm::EventPayload payload;
       payload["ticket"] = ticket;
       payload["instance"] = expected_instance;
       payload["revision"] = as_payload(change.expected_revision);
-      payload["deadline"] = deadline_ns ? static_cast<std::int64_t>(*deadline_ns) : no_deadline;
       bool posted = false;
       {
         std::lock_guard<std::mutex> order(entry->post_order);

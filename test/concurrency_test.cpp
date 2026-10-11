@@ -273,6 +273,41 @@ TEST(async_engage_replies_under_concurrent_ticks) {
   CHECK_EQ(zeroed.load(), clients * 60);
 }
 
+// A caller that gives up withdraws its release while the tick may be applying it: each change is applied or
+// withdrawn, never both, and the reply the caller built from the results stays true.
+TEST(a_release_is_applied_or_withdrawn_never_both) {
+  Domain domain;
+  domain.add("a");
+  Sink sink;
+  TickThread ticker(domain, sink);
+  int applied = 0, withdrawn = 0;
+  for (int round = 0; round < 300; ++round) {
+    domain.engage({"a"});
+    CHECK(wait_until([&] { return get(domain, "a").stage != Stage::gated; }));
+    const std::uint64_t revision = get(domain, "a").revision;
+    const Pending release = domain.release(domain.instance_id(), {{"a", revision}});
+    std::this_thread::sleep_for(microseconds(round % 8 * 40));  // from "at once" to about two ticks
+    const std::size_t taken_back = release.withdraw();
+    CHECK(release.done());
+    if (taken_back == 1) {
+      CHECK_EQ(release.results()[0].outcome, Outcome::expired);
+      // The event is still queued. Let the tick see it: it must change nothing.
+      const int writes = sink.writes("a");
+      CHECK(wait_until([&] { return sink.writes("a") >= writes + 3; }));
+      CHECK(get(domain, "a").held);
+      CHECK_EQ(get(domain, "a").revision, revision);
+      CHECK(!domain.admit("a", domain.now()));
+      ++withdrawn;
+    } else {
+      CHECK_EQ(release.results()[0].outcome, Outcome::released);
+      CHECK(!get(domain, "a").held);
+      CHECK_EQ(get(domain, "a").revision, revision + 1);
+      ++applied;
+    }
+  }
+  CHECK_EQ(applied + withdrawn, 300);
+}
+
 // A fault reported by the host engages the robot and sets the fault in one step of the machine's queue. A release
 // that races it, at any point, can neither undo the hold nor swallow the fault.
 TEST(a_release_cannot_come_between_a_fault_and_its_engage) {
@@ -349,11 +384,13 @@ TEST(a_stuck_device_write_does_not_delay_the_gate) {
   CHECK_EQ(service.call("State", "").status, Status::ok);
   CHECK(domain.admit("zz", domain.now()) == false);
 
-  // The release cannot be applied while the tick is stuck: the call fails and nothing is released, now or later.
+  // The release cannot be applied while the tick is stuck: the call reports it expired and nothing is released,
+  // now or later.
   const std::string release = "{\"expected_instance\":\"" + domain.instance_id() +
                               "\",\"changes\":[{\"robot_id\":\"a\",\"expected_revision\":1}]}";
   const ServiceReply failed = service.call("Release", release);
-  CHECK_EQ(failed.status, Status::deadline_exceeded);
+  CHECK_EQ(failed.status, Status::ok);
+  CHECK_EQ(json::parse(failed.body)["robots"][0]["outcome"].get<std::string>(), "expired");
   CHECK(!domain.admit("a", domain.now()));
   CHECK(get(domain, "a").held);
 

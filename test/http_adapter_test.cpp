@@ -183,9 +183,7 @@ TEST(a_hold_cycle_over_http_with_the_instance_of_the_host) {
 }
 
 TEST(errors_use_the_xrpc_envelope_and_the_http_statuses_of_the_vocabulary) {
-  RigOptions options;
-  options.service.release_wait = milliseconds(100);
-  Rig rig(options);
+  Rig rig;
   const std::string prefix = HttpAdapter::route_prefix();
 
   const xrpc::HttpResponse get = rig.call("GET", prefix + "State");
@@ -215,14 +213,22 @@ TEST(errors_use_the_xrpc_envelope_and_the_http_statuses_of_the_vocabulary) {
   CHECK(is_envelope(missing, "not_found"));
   CHECK(parse(missing.body)["error"]["message"].get<std::string>().find("nobody") != std::string::npos);
 
-  // Nothing ticks the host's native loop once the ticker is gone for good: the release cannot be applied.
-  rig.ticker.reset();
+  CHECK_EQ(rig.left_to_the_host.load(), 0);
+}
+
+TEST(a_release_the_native_loop_cannot_apply_is_reported_expired) {
+  RigOptions options;
+  options.tick = false;  // the native loop does not run: the release cannot be applied
+  options.service.release_wait = milliseconds(100);
+  Rig rig(options);
   CHECK_EQ(rig.post("Engage", "{\"robot_ids\":[\"gz-1\"]}").status, 200);
   const xrpc::HttpResponse late = rig.post("Release", rig.release_body("gz-1", 1));
-  CHECK_EQ(late.status, 504);
-  CHECK(is_envelope(late, "deadline_exceeded"));
+  CHECK_EQ(late.status, 200);
+  CHECK_EQ(parse(late.body)["robots"][0]["outcome"].get<std::string>(), "expired");
   CHECK(rig.hold->domain().state({"gz-1"}).robots[0].held);
-  CHECK_EQ(rig.left_to_the_host.load(), 0);
+  rig.start_ticker();
+  CHECK(wait_until([&] { return rig.hold->domain().state({"gz-1"}).robots[0].stage == Stage::zero_written; }));
+  CHECK(rig.hold->domain().state({"gz-1"}).robots[0].held);  // the release that gave up stays unapplied
 }
 
 TEST(requests_outside_the_capability_stay_with_the_host) {

@@ -29,9 +29,10 @@ struct DomainImpl;
 using TimeNs = std::int64_t;
 
 enum class Stage { released, gated, zero_written, stopped };
-// expired: a release that reached the machine after its deadline and was not applied; the service answers it with
-// an error status, it is never a per-robot outcome on the wire.
-enum class Outcome { engaged, already_held, released, conflict, not_held, unknown_robot, expired };
+// pending: the change of a release that the tick has not applied yet (only in Pending::results before done(); the
+// service never reports it). expired: a change that its caller withdrew (Pending::withdraw) before the tick applied
+// it; it is never applied.
+enum class Outcome { engaged, already_held, released, conflict, not_held, unknown_robot, pending, expired };
 
 const char *to_string(Stage) noexcept;
 const char *to_string(Outcome) noexcept;
@@ -135,13 +136,19 @@ struct TickStats {
 class Pending {
 public:
   Pending() = default;
-  // True once the tick has applied the operation for every robot (unknown robots count as applied at once).
+  // True once every robot of the operation has its result: the tick applied it, it was withdrawn, or the robot is
+  // not in the roster (counted at once).
   bool done() const;
   // The result per robot, in the order of the request. Once done() these are the outcomes the machines decided;
   // before that an engage reports what the gate decided when it arrived (engaged if it was the one that closed
-  // it, already_held otherwise) and a release reports conflict, "not applied". The state of every robot is the one
-  // that State would report now.
+  // it, already_held otherwise) and a release reports pending for a change that is still waiting for the tick.
+  // The state of every robot is the one that State would report now.
   std::vector<RobotResult> results() const;
+  // Withdraws the changes of a release that the tick has not applied yet: they will never be applied, and their
+  // results are expired. This is how a caller that cannot wait any longer ends a release without a late surprise:
+  // each change is either applied by the tick before it is withdrawn, and then it is in the results, or not
+  // applied at all. Returns how many changes it withdrew; none for an engage, which always applies.
+  std::size_t withdraw() const;
 
   // Made by the domain.
   explicit Pending(std::shared_ptr<detail::Operation> operation) : operation_(std::move(operation)) {}
@@ -180,10 +187,9 @@ public:
   // Compare and set, decided by the machine of each robot when the tick applies it. expected_instance must equal
   // instance_id(), otherwise every change is a conflict. Per robot: not held -> not_held; a host fault or
   // expected_revision != revision -> conflict; otherwise released: revision + 1, stage released, release fence =
-  // the time the tick applied it, which is also when admission opens again. A release that the tick has not
-  // applied by deadline_ns (domain clock) is not applied at all (expired); no deadline: it waits for the tick.
-  Pending release(const std::string &expected_instance, const std::vector<ReleaseChange> &changes,
-                  std::optional<TimeNs> deadline_ns = std::nullopt);
+  // the time the tick applied it, which is also when admission opens again. The release waits in the robot's queue
+  // for the tick; a caller that gives up withdraws it (Pending::withdraw).
+  Pending release(const std::string &expected_instance, const std::vector<ReleaseChange> &changes);
 
   // Read-only snapshot; no ids = every robot in the roster.
   Snapshot state(const std::vector<std::string> &robot_ids = {}) const;

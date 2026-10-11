@@ -1,7 +1,7 @@
 // The state machine of one robot.
 //
 //   Released ---------- Engage ----------> Held
-//   Held ------- Release [instance, revision, deadline, no fault] -----> Released
+//   Held ------- Release [instance, revision, no fault, not withdrawn] -----> Released
 //
 //   Held contains          Gated --ZeroWritten--> ZeroWritten --MotionStopped--> Stopped
 //                          ZeroWritten, Stopped --ZeroFailed--> Gated      Stopped --MotionResumed--> ZeroWritten
@@ -99,12 +99,11 @@ public:
 class HeldState final : public StageState {
 public:
   explicit HeldState(Entry &entry) : StageState(entry, "Held") {}
-  // The guard of the release refused it: late, or the wrong instance, revision or a fault.
+  // The guard of the release refused it: the wrong instance or revision, a fault, or the caller withdrew it (then
+  // the ticket is gone and nobody waits for the outcome).
   sm::ActionResult onEvent(sm::StateContext &, const sm::Event &event) override {
-    if (event.id == ev::Release) {
-      const bool late = entry_.domain.now() > number(event, "deadline", no_deadline);
-      entry_.resolve(number(event, "ticket"), late ? Outcome::expired : Outcome::conflict);
-    }
+    if (event.id == ev::Release)
+      entry_.resolve(number(event, "ticket"), Outcome::conflict);
     return {};
   }
 };
@@ -206,13 +205,14 @@ std::unique_ptr<sm::StateMachine> detail::make_hold_machine(Entry &entry) {
     return sm::Status{};
   };
 
-  // Release: the fence is taken before admission opens, so that nothing received while held is admitted later.
+  // Release: the guard and the action run under one hold of the entry mutex, and a caller that gives up withdraws
+  // its ticket under the same mutex, so a change is applied or withdrawn, never both. The fence is taken before
+  // admission opens, so that nothing received while held is admitted later.
   const Guard release_allowed = [self](const sm::GuardContext &guard) {
     const sm::Event &event = *guard.event();
-    const TimeNs now = self->domain.now();
-    return text(event, "instance") == self->domain.options.instance_id &&
-           static_cast<std::uint64_t>(number(event, "revision")) == self->state.revision && self->state.fault.empty() &&
-           now <= number(event, "deadline", no_deadline);
+    return self->tickets.count(number(event, "ticket")) == 1 &&
+           text(event, "instance") == self->domain.options.instance_id &&
+           static_cast<std::uint64_t>(number(event, "revision")) == self->state.revision && self->state.fault.empty();
   };
   const Rule released = [self](sm::StateContext &ctx) {
     const sm::Event &event = *ctx.event();

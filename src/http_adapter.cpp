@@ -19,7 +19,6 @@ int http_status(Status status) {
     case Status::ok: return 200;
     case Status::invalid_argument: return 400;
     case Status::not_found: return 404;
-    case Status::deadline_exceeded: return 504;
     case Status::internal: return 500;
   }
   return 500;

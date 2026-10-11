@@ -416,26 +416,34 @@ TEST(release_applies_the_compare_and_set) {
 TEST(a_release_waits_for_the_tick_and_is_not_applied_after_its_call_gave_up) {
   Domain domain;
   domain.add("a");
+  domain.add("b");
   ServiceOptions options;
   options.reply_wait = milliseconds(0);
   options.release_wait = milliseconds(60);
   Service service(domain, options);
   Sink sink;
   const std::string instance = domain.instance_id();
-  const std::string release = release_body(instance, "[{\"robot_id\":\"a\",\"expected_revision\":1}]");
-  domain.engage({"a"});
+  const std::string release = release_body(
+      instance, "[{\"robot_id\":\"a\",\"expected_revision\":1},{\"robot_id\":\"zz\",\"expected_revision\":0}]");
+  domain.engage({"a", "b"});
   domain.tick(sink);  // this thread is the tick thread, and it stops ticking for now
 
-  // Nobody ticks: the release cannot be applied, the call fails, and the robot stays held.
+  // Nobody ticks: the change is withdrawn at the end of the wait and the robot stays held. The reply says so per
+  // robot; it is not an error.
   const auto started = Clock::now();
-  const ServiceReply failed = service.call("Release", release);
+  const ServiceReply gave_up = service.call("Release", release);
   CHECK(Clock::now() - started >= milliseconds(50));
-  CHECK_EQ(failed.status, Status::deadline_exceeded);
-  CHECK_EQ(body_of(failed)["code"].get<std::string>(), "deadline_exceeded");
+  CHECK_EQ(gave_up.status, Status::ok);
+  const json first = body_of(gave_up);
+  REQUIRE(first["robots"].size() == 2);
+  CHECK_EQ(first["robots"][0]["outcome"].get<std::string>(), "expired");
+  CHECK(first["robots"][0]["held"].get<bool>());
+  CHECK_EQ(first["robots"][0]["revision"].get<std::uint64_t>(), 1);
+  CHECK_EQ(first["robots"][1]["outcome"].get<std::string>(), "unknown_robot");
   CHECK(domain.state({"a"}).robots[0].held);
   CHECK(!domain.admit("a", domain.now()));
 
-  // The tick comes back: the release that gave up is not applied late.
+  // The tick comes back: the change that gave up is not applied late.
   domain.tick(sink);
   CHECK(domain.state({"a"}).robots[0].held);
   CHECK(!domain.admit("a", domain.now()));
@@ -457,6 +465,15 @@ TEST(a_release_waits_for_the_tick_and_is_not_applied_after_its_call_gave_up) {
   const ServiceReply done = future.get();
   CHECK_EQ(done.status, Status::ok);
   CHECK_EQ(body_of(done)["robots"][0]["outcome"].get<std::string>(), "released");
+
+  // A request whose deadline is over by the time it arrives is executed if it is an engage and withdrawn if it
+  // is a release.
+  const ServiceReply late_release = patient.call("Release", release_body(instance, "[{\"robot_id\":\"b\",\"expected_revision\":1}]"),
+                                                 Clock::now() - seconds(1));
+  CHECK_EQ(body_of(late_release)["robots"][0]["outcome"].get<std::string>(), "expired");
+  CHECK(domain.state({"b"}).robots[0].held);
+  domain.tick(sink);
+  CHECK(domain.state({"b"}).robots[0].held);
 }
 
 // A control loop that sleeps until it is woken: DomainOptions::wake is all the host has to connect.
@@ -716,6 +733,12 @@ TEST(body_size_limit_is_inclusive_and_options_are_validated) {
   ServiceOptions endless;
   endless.reply_wait = std::chrono::hours(2);
   CHECK(throws(endless));
+  ServiceOptions no_release_wait;
+  no_release_wait.release_wait = milliseconds(0);  // every release would be withdrawn at once
+  CHECK(throws(no_release_wait));
+  ServiceOptions endless_release;
+  endless_release.release_wait = std::chrono::hours(2);
+  CHECK(throws(endless_release));
   ServiceOptions no_ids;
   no_ids.max_ids = 0;
   CHECK(throws(no_ids));

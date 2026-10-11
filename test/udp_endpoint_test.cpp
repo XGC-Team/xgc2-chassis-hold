@@ -149,7 +149,7 @@ TEST(engage_without_a_tick_reports_gated_and_the_zero_follows) {
   CHECK_EQ(stage, "zero_written");
 }
 
-TEST(a_release_the_tick_cannot_apply_fails_with_deadline_exceeded_and_is_not_applied_later) {
+TEST(a_release_the_tick_cannot_apply_is_reported_expired_and_not_applied_later) {
   RigOptions options;
   options.tick = false;
   options.service.release_wait = milliseconds(150);
@@ -157,12 +157,13 @@ TEST(a_release_the_tick_cannot_apply_fails_with_deadline_exceeded_and_is_not_app
   const std::string instance = rig.domain.instance_id();
   REQUIRE(answered(rig.call("Engage", json{{"all", true}})));  // the gate closes without a tick
 
-  // Nobody ticks: the release is not applied, and the caller is told so instead of waiting for a device.
+  // Nobody ticks: the change is withdrawn after release_wait and the caller is told, instead of waiting for a device.
   const auto started = std::chrono::steady_clock::now();
   const udp::Response release = rig.call("Release", parse(rig.release_body(instance, 1)), seconds(2), instance);
   CHECK(std::chrono::steady_clock::now() - started >= milliseconds(120));
-  CHECK(answered(release, udp::Status::DeadlineExceeded));
-  CHECK_EQ(parse(release.body)["code"].get<std::string>(), "deadline_exceeded");
+  REQUIRE(answered(release));
+  CHECK_EQ(first_outcome(parse(release.body)), "expired");
+  CHECK(parse(release.body)["robots"][0]["held"].get<bool>());
   CHECK(rig.domain.state({"ugv-1"}).robots[0].held);
 
   // The tick starts; the release that gave up does not come back to life, and a new one goes through.

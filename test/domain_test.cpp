@@ -268,26 +268,53 @@ TEST(a_release_queued_before_an_engage_cannot_open_the_gate) {
   CHECK_EQ(get(domain, "r").revision, 3);
 }
 
-TEST(a_release_that_the_tick_does_not_reach_in_time_is_not_applied) {
+TEST(a_release_the_caller_withdraws_before_the_tick_is_never_applied) {
   FakeClock clock;
   Domain domain(clock.options());
   Sink sink;
   domain.add("r");
-  engaged(domain, sink, {"r"});
+  domain.add("s");
+  engaged(domain, sink, {"r", "s"});
 
-  const Pending release = domain.release(domain.instance_id(), {{"r", 1}}, clock.ns + 5 * ms);
-  clock.advance(10);  // the tick is late
-  domain.tick(sink);
-  REQUIRE(release.done());
+  const Pending release = domain.release(domain.instance_id(), {{"r", 1}, {"nobody", 1}, {"s", 1}});
+  CHECK(!release.done());
+  CHECK_EQ(release.results()[0].outcome, Outcome::pending);  // waiting for the tick
+  CHECK_EQ(release.results()[2].outcome, Outcome::pending);
+  CHECK_EQ(release.withdraw(), 2);  // the tick never came; the unknown robot has nothing to take back
+  CHECK(release.done());
   CHECK_EQ(release.results()[0].outcome, Outcome::expired);
+  CHECK_EQ(release.results()[1].outcome, Outcome::unknown_robot);
+  CHECK_EQ(release.results()[2].outcome, Outcome::expired);
+  CHECK_EQ(release.withdraw(), 0);
+
+  // The event is still in the queue of the machines; when the tick gets to it, it changes nothing.
+  clock.advance(10);
+  domain.tick(sink);
   CHECK(get(domain, "r").held);
+  CHECK(get(domain, "s").held);
   CHECK_EQ(get(domain, "r").revision, 1);
   CHECK(!domain.admit("r", clock.ns));
+  CHECK_EQ(release.results()[0].outcome, Outcome::expired);
 
-  // On time it applies.
-  const Pending on_time = domain.release(domain.instance_id(), {{"r", 1}}, clock.ns + 5 * ms);
+  // What the tick applied before the withdrawal stays applied and is reported as it happened.
+  const Pending applied = domain.release(domain.instance_id(), {{"r", 1}});
   domain.tick(sink);
-  CHECK_EQ(on_time.results()[0].outcome, Outcome::released);
+  CHECK_EQ(applied.withdraw(), 0);
+  CHECK_EQ(applied.results()[0].outcome, Outcome::released);
+  CHECK(!get(domain, "r").held);
+
+  // An engage always applies: there is nothing to withdraw.
+  const Pending engage = domain.engage({"r"});
+  CHECK_EQ(engage.withdraw(), 0);
+  domain.tick(sink);
+  CHECK_EQ(engage.results()[0].outcome, Outcome::engaged);
+  CHECK(get(domain, "r").held);
+
+  // A default constructed Pending is done and empty.
+  const Pending nothing;
+  CHECK(nothing.done());
+  CHECK_EQ(nothing.withdraw(), 0);
+  CHECK(nothing.results().empty());
 }
 
 TEST(tick_reasserts_zero_every_tick_while_held) {

@@ -21,7 +21,7 @@ namespace ev {
 // The events of a robot's machine.
 enum : sm::EventId {
   Engage = 1,     // ticket, at
-  Release,        // ticket, instance, revision, deadline
+  Release,        // ticket, instance, revision
   ZeroWritten,    // binding, revision: the device took a zero command
   ZeroFailed,     // binding, revision, error
   MotionStopped,  // binding, revision: feedback showed rest for the dwell
@@ -38,7 +38,6 @@ enum : sm::StateId { Released = 1, Held, Gated, ZeroWritten, Stopped, Faulted };
 }  // namespace st
 
 constexpr TimeNs no_fence = std::numeric_limits<TimeNs>::min();
-constexpr std::int64_t no_deadline = std::numeric_limits<std::int64_t>::max();
 
 // The gate mirror of a robot: what command admission reads without taking a lock. Bit 0 says the machine holds the
 // robot; each engage that arrived and that the machine has not applied yet counts 2; the top bit says the machine
@@ -57,6 +56,7 @@ struct Entry;
 struct Item {
   Entry *entry = nullptr;  // null: the robot is not in the roster
   std::string robot_id;
+  std::int64_t ticket = 0;  // of a release: what Pending::withdraw takes back
   Outcome provisional = Outcome::unknown_robot;
   std::atomic<int> resolved{-1};  // the Outcome the machine decided, or -1
 };

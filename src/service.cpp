@@ -268,7 +268,6 @@ const char *to_string(Status status) noexcept {
     case Status::ok: return "ok";
     case Status::invalid_argument: return "invalid_argument";
     case Status::not_found: return "not_found";
-    case Status::deadline_exceeded: return "deadline_exceeded";
     case Status::internal: return "internal";
   }
   return "internal";
@@ -295,7 +294,7 @@ struct Service::Impl {
   Impl(Domain &domain_in, ServiceOptions options_in)
       : domain(domain_in), options(std::move(options_in)), shared(std::make_shared<Shared>()) {
     if (options.reply_wait.count() < 0 || options.reply_wait > std::chrono::hours(1) ||
-        options.release_wait.count() < 0 || options.release_wait > std::chrono::hours(1) || options.max_ids == 0 ||
+        options.release_wait.count() < 1 || options.release_wait > std::chrono::hours(1) || options.max_ids == 0 ||
         options.max_body_bytes < 2)
       throw std::invalid_argument("invalid chassis hold service options");
     auto wake_target = shared;
@@ -352,19 +351,13 @@ struct Service::Impl {
     return true;
   }
 
-  // The reply reports the state at the time it is sent, with the outcome each robot got from the machine (an
-  // engage the tick has not applied reports what the gate decided; a release it has not applied fails).
+  // The reply reports the state at the time it is sent, with the outcome each robot got from the machine: an engage
+  // the tick has not applied reports what the gate decided, and a release is settled first: what the tick has not
+  // applied by now is withdrawn (expired), so that the reply is true for good.
   ServiceReply finish(const Waiter &waiter) const {
-    const std::vector<RobotResult> results = waiter.pending.results();
-    if (waiter.release) {
-      const bool applied = waiter.pending.done();
-      bool expired = !applied;
-      for (const auto &result : results)
-        expired = expired || result.outcome == Outcome::expired;
-      if (expired)
-        return error_reply(Status::deadline_exceeded, "the native tick did not apply the release in time; nothing was released");
-    }
-    return mutation_reply(domain.instance_id(), results);
+    if (waiter.release)
+      waiter.pending.withdraw();
+    return mutation_reply(domain.instance_id(), waiter.pending.results());
   }
 
   // The service thread: completes waiters when the tick has applied them (the domain listener wakes it) or their
@@ -430,9 +423,7 @@ struct Service::Impl {
     Waiter waiter;
     waiter.release = true;
     waiter.until = std::min(Clock::now() + options.release_wait, deadline);
-    // The machines apply the release only if the tick gets to it before the call gives up.
-    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(waiter.until - Clock::now());
-    waiter.pending = domain.release(request.expected_instance, request.changes, domain.now() + left.count());
+    waiter.pending = domain.release(request.expected_instance, request.changes);
     wait_for(std::move(waiter), callback);
   }
 

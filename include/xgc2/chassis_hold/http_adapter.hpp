@@ -28,7 +28,7 @@ public:
   // errors, and from the service's thread, never the host's I/O thread, for an Engage or Release that waits for the
   // native tick. The request deadline bounds the wait. Bodies and statuses are those of Service; errors use the
   // XRPC envelope {"error":{"code","message"}} with 400 invalid_argument, 404 not_found, 405 for a method other than
-  // POST (code invalid_argument, header Allow: POST), 500 internal and 504 deadline_exceeded. The instance header
+  // POST (code invalid_argument, header Allow: POST) and 500 internal. The instance header
   // is the host's: give the domain the instance id of the host's HttpIdentity (DomainOptions::instance_id), so
   // that the header, the pin of a caller and the instance in the bodies are one value.
   bool handle(const xgc2::xrpc::HttpRequest &request, const xgc2::xrpc::HttpReply &reply) const;
