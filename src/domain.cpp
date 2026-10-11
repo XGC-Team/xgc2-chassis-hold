@@ -325,7 +325,7 @@ bool detail::DomainImpl::add_robot(const std::string &robot_id, bool feedback, b
 
 bool Domain::add(const std::string &robot_id, bool feedback) {
   if (!valid_robot_id(robot_id))
-    throw std::invalid_argument("invalid robot id");
+    throw std::invalid_argument("invalid robot id \"" + clean_text(robot_id) + "\"");
   bool needs_tick = false;
   const bool added = impl_->add_robot(robot_id, feedback, needs_tick);
   if (needs_tick)

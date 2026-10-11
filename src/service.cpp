@@ -506,6 +506,13 @@ Service::~Service() = default;
 
 const std::string &Service::instance_id() const noexcept { return impl_->domain.instance_id(); }
 
+std::vector<std::string> Service::entities() const {
+  std::vector<std::string> ids;
+  for (const auto &robot : impl_->domain.describe().robots)
+    ids.push_back(robot.robot_id);
+  return ids;
+}
+
 void Service::call_async(const std::string &method, const std::string &body, Clock::time_point deadline,
                          Callback callback) {
   impl_->dispatch(method, body, deadline, callback);

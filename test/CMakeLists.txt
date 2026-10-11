@@ -31,6 +31,7 @@ endfunction()
 
 chassis_hold_test(domain_test)
 chassis_hold_test(service_test)
+chassis_hold_test(facade_test)
 chassis_hold_test(concurrency_test)
 
 # The udp.v1 endpoint with the xrpc client, and the xgc2-hold tool; $TMPDIR holds the key files of the tests.

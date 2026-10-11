@@ -15,9 +15,9 @@ find_package(Threads REQUIRED)
 find_package(XgcNlohmannJson REQUIRED)
 find_package(xgc2_state_machine 0.1.3 CONFIG REQUIRED)
 
-# Component core: the domain (a state machine per robot) and the transport-neutral JSON service. Needs the
-# xgc2-state-machine library and, at build time only, nlohmann-json; no header exposes either.
-add_library(xgc2_chassis_hold SHARED src/domain.cpp src/hold_machine.cpp src/service.cpp)
+# Component core: the domain (a state machine per robot), the transport-neutral JSON service and the facade a host
+# instantiates. Needs the xgc2-state-machine library and, at build time only, nlohmann-json; no header exposes either.
+add_library(xgc2_chassis_hold SHARED src/domain.cpp src/hold_machine.cpp src/service.cpp src/chassis_hold.cpp)
 add_library(XgcChassisHold::core ALIAS xgc2_chassis_hold)
 set_target_properties(xgc2_chassis_hold PROPERTIES EXPORT_NAME core VERSION ${PROJECT_VERSION} SOVERSION 1)
 target_include_directories(xgc2_chassis_hold PUBLIC
@@ -57,7 +57,12 @@ if(XGC2_CHASSIS_HOLD_BUILD_UDP)
   install(TARGETS xgc2-hold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# Headers of the components that were built.
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  PATTERN "udp_endpoint.hpp" EXCLUDE)
+if(XGC2_CHASSIS_HOLD_BUILD_UDP)
+  install(FILES include/xgc2/chassis_hold/udp_endpoint.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/chassis_hold)
+endif()
 install(DIRECTORY contracts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/xgc2-chassis-hold/contracts)
 configure_package_config_file(cmake/XgcChassisHoldConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/XgcChassisHoldConfig.cmake

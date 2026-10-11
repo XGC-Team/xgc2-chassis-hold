@@ -9,10 +9,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -27,6 +23,7 @@ using namespace xgc2::chassis_hold;
 namespace udp = xgc2::xrpc::udp;
 using json = nlohmann::json;
 using fixtures::Sink;
+using fixtures::TempDir;
 using fixtures::TickThread;
 using std::chrono::milliseconds;
 using std::chrono::seconds;
@@ -51,49 +48,6 @@ inline std::string base64(const std::string &bytes) {
 }
 
 inline std::string key_line(std::uint32_t id, const std::string &key) { return std::to_string(id) + " " + base64(key) + "\n"; }
-
-// A scratch directory below $TMPDIR (ctest sets it to the build directory) for key files.
-class TempDir {
-public:
-  TempDir() {
-    const char *base = std::getenv("TMPDIR");
-    std::string pattern = std::string(base && *base ? base : "/tmp") + "/xgc2-hold-test-XXXXXX";
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-    if (!mkdtemp(buffer.data()))
-      throw std::runtime_error("mkdtemp failed");
-    path_ = buffer.data();
-  }
-  ~TempDir() {
-    for (const auto &file : files_)
-      unlink(file.c_str());
-    rmdir(path_.c_str());
-  }
-  TempDir(const TempDir &) = delete;
-  TempDir &operator=(const TempDir &) = delete;
-
-  std::string write(const std::string &name, const std::string &content) {
-    const std::string file = path_ + "/" + name;
-    const int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0)
-      throw std::runtime_error("cannot create " + file);
-    files_.push_back(file);
-    std::size_t done = 0;
-    while (done < content.size()) {
-      const ssize_t n = ::write(fd, content.data() + done, content.size() - done);
-      if (n <= 0)
-        break;
-      done += static_cast<std::size_t>(n);
-    }
-    close(fd);
-    return file;
-  }
-  const std::string &path() const { return path_; }
-
-private:
-  std::string path_;
-  std::vector<std::string> files_;
-};
 
 struct RigOptions {
   std::uint16_t port = 0;

@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace xgc2::chassis_hold {
 
@@ -51,6 +52,8 @@ public:
 
   // The instance id of the domain: what transports put in their server identity.
   const std::string &instance_id() const noexcept;
+  // The robots in the roster now, sorted: the entities this capability is served for (see HttpAdapter).
+  std::vector<std::string> entities() const;
 
   // method is one of Describe, State, Engage, Release (not found otherwise); body is the request JSON (an empty
   // body is {}). Engage and Release block the calling thread until the tick has applied them, for at most

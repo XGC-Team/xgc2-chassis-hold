@@ -2,8 +2,14 @@
 // Test doubles shared by the test programs.
 #include <xgc2/chassis_hold/domain.hpp>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -11,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fixtures {
 
@@ -87,18 +94,68 @@ private:
   std::set<std::string> failing_ids;
 };
 
-// The host's native thread: ticks the domain until stopped.
+// A private scratch directory below $TMPDIR (ctest sets it to the build directory), for key files and sockets. The
+// destructor removes whatever the test left in it.
+class TempDir {
+public:
+  TempDir() {
+    const char *base = std::getenv("TMPDIR");
+    std::string pattern = std::string(base && *base ? base : "/tmp") + "/xgc2-hold-test-XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (!mkdtemp(buffer.data()))
+      throw std::runtime_error("mkdtemp failed");
+    path_ = buffer.data();
+  }
+  ~TempDir() {
+    if (DIR *directory = opendir(path_.c_str())) {
+      while (const dirent *entry = readdir(directory)) {
+        const std::string name = entry->d_name;
+        if (name != "." && name != "..")
+          unlink((path_ + "/" + name).c_str());
+      }
+      closedir(directory);
+    }
+    rmdir(path_.c_str());
+  }
+  TempDir(const TempDir &) = delete;
+  TempDir &operator=(const TempDir &) = delete;
+
+  std::string write(const std::string &name, const std::string &content) {
+    const std::string file = path_ + "/" + name;
+    const int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+      throw std::runtime_error("cannot create " + file);
+    std::size_t done = 0;
+    while (done < content.size()) {
+      const ssize_t n = ::write(fd, content.data() + done, content.size() - done);
+      if (n <= 0)
+        break;
+      done += static_cast<std::size_t>(n);
+    }
+    close(fd);
+    return file;
+  }
+  const std::string &path() const { return path_; }
+
+private:
+  std::string path_;
+};
+
+// The host's native thread: runs its tick until stopped.
 class TickThread {
 public:
-  TickThread(xgc2::chassis_hold::Domain &domain, Sink &sink, std::function<void()> extra = nullptr)
-      : thread_([this, &domain, &sink, extra] {
+  explicit TickThread(std::function<void()> tick, std::function<void()> extra = nullptr)
+      : thread_([this, tick, extra] {
           while (running_) {
-            domain.tick(sink);
+            tick();
             if (extra)
               extra();
             std::this_thread::sleep_for(std::chrono::microseconds(150));
           }
         }) {}
+  TickThread(xgc2::chassis_hold::Domain &domain, Sink &sink, std::function<void()> extra = nullptr)
+      : TickThread([&domain, &sink] { domain.tick(sink); }, std::move(extra)) {}
   ~TickThread() { stop(); }
   void stop() {
     running_ = false;
