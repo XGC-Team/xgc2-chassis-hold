@@ -11,7 +11,7 @@
 
 // The replacement operators below pair new with malloc and delete with free on purpose; GCC 13 inlines them in
 // sanitizer builds and reports the pair as a mismatch.
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
 #pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 #endif
 
