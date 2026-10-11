@@ -26,14 +26,16 @@ using xgc2::chassis_hold::TimeNs;
 
 constexpr TimeNs ms = 1000000;
 
-// Polls until the condition holds or the timeout ends; false on timeout.
+// Polls until the condition holds or the timeout ends; false on timeout. A condition that calls a rate limited
+// service passes a longer interval.
 inline bool wait_until(const std::function<bool()> &condition,
-                       std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
+                       std::chrono::milliseconds timeout = std::chrono::seconds(10),
+                       std::chrono::microseconds interval = std::chrono::microseconds(100)) {
   const auto end = std::chrono::steady_clock::now() + timeout;
   while (!condition()) {
     if (std::chrono::steady_clock::now() > end)
       return false;
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    std::this_thread::sleep_for(interval);
   }
   return true;
 }

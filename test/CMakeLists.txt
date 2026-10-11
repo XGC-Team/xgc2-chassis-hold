@@ -62,6 +62,18 @@ if(TARGET XgcChassisHold::udp)
   add_test(NAME chassis_hold_cli_test COMMAND chassis_hold_cli_test ${_xgc2_hold_cli})
   set_tests_properties(chassis_hold_cli_test PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
+
+  # The driver shapes of the README (Wheeltec, Scout) with stand-ins for their devices, called over udp.v1.
+  add_executable(chassis_hold_host_shapes_udp_test host_shapes_udp_test.cpp)
+  target_link_libraries(chassis_hold_host_shapes_udp_test PRIVATE XgcChassisHold::udp XgcXrpc::udp
+    nlohmann_json::nlohmann_json Threads::Threads)
+  target_compile_options(chassis_hold_host_shapes_udp_test PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(chassis_hold_host_shapes_udp_test PRIVATE -Werror)
+  endif()
+  add_test(NAME chassis_hold_host_shapes_udp_test COMMAND chassis_hold_host_shapes_udp_test)
+  set_tests_properties(chassis_hold_host_shapes_udp_test PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # The http.v1 adapter on a real xrpc http host over a Unix socket; $TMPDIR holds the socket directories of the tests.
@@ -75,5 +87,19 @@ if(TARGET XgcChassisHold::http)
   endif()
   add_test(NAME chassis_hold_http_adapter_test COMMAND chassis_hold_http_adapter_test)
   set_tests_properties(chassis_hold_http_adapter_test PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
+if(TARGET XgcChassisHold::http)
+  # The world-host shapes of the README (Gazebo, XSIM) with stand-ins for their worlds, on a real xrpc http host.
+  add_executable(chassis_hold_host_shapes_http_test host_shapes_http_test.cpp)
+  target_link_libraries(chassis_hold_host_shapes_http_test PRIVATE XgcChassisHold::http nlohmann_json::nlohmann_json
+    Threads::Threads)
+  target_compile_options(chassis_hold_host_shapes_http_test PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(chassis_hold_host_shapes_http_test PRIVATE -Werror)
+  endif()
+  add_test(NAME chassis_hold_host_shapes_http_test COMMAND chassis_hold_host_shapes_http_test)
+  set_tests_properties(chassis_hold_host_shapes_http_test PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
 endif()

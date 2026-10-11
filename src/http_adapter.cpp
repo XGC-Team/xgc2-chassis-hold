@@ -24,13 +24,12 @@ int http_status(Status status) {
   return 500;
 }
 
+// The XRPC error envelope around the error body of the service: {"error":{"code","message"[,"details"]}}.
 xrpc::HttpResponse response_of(const ServiceReply &reply) {
-  if (reply.status != Status::ok)
-    return xrpc::http_error(http_status(reply.status), to_string(reply.status), reply.message);
   xrpc::HttpResponse response;
-  response.status = 200;
+  response.status = http_status(reply.status);
   response.headers.emplace_back("Content-Type", "application/json");
-  response.body = reply.body;
+  response.body = reply.status == Status::ok ? reply.body : "{\"error\":" + reply.body + "}";
   return response;
 }
 

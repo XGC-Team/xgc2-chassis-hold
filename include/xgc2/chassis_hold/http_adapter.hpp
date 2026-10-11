@@ -26,9 +26,10 @@ public:
   // False, with request and reply untouched, when the target is not under route_prefix(): the host serves it.
   // True when the adapter took the request, and the reply is completed exactly once: at once for Describe, State and
   // errors, and from the service's thread, never the host's I/O thread, for an Engage or Release that waits for the
-  // native tick. The request deadline bounds the wait. Bodies and statuses are those of Service; errors use the
-  // XRPC envelope {"error":{"code","message"}} with 400 invalid_argument, 404 not_found, 405 for a method other than
-  // POST (code invalid_argument, header Allow: POST) and 500 internal. The instance header
+  // native tick. The request deadline bounds the wait. Bodies are those of Service; an error is the XRPC envelope
+  // {"error":{"code","message"[,"details"]}} around the body of the service's error, with 400 invalid_argument,
+  // 404 not_found and 500 internal, and 405 for a method other than POST (code invalid_argument, header
+  // Allow: POST). The instance header
   // is the host's: give the domain the instance id of the host's HttpIdentity (DomainOptions::instance_id), so
   // that the header, the pin of a caller and the instance in the bodies are one value.
   bool handle(const xgc2::xrpc::HttpRequest &request, const xgc2::xrpc::HttpReply &reply) const;

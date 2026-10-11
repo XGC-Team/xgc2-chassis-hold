@@ -2,14 +2,10 @@
 // host (Gazebo, XSIM) serves the capability next to its own routes.
 #include "check.hpp"
 #include "fixtures.hpp"
+#include "http_fixtures.hpp"
 
 #include <xgc2/chassis_hold/chassis_hold.hpp>
 #include <xgc2/chassis_hold/http_adapter.hpp>
-#include <xgc2/xrpc/http.hpp>
-
-#include <nlohmann/json.hpp>
-
-#include <strings.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,10 +14,8 @@
 #include <vector>
 
 using namespace xgc2::chassis_hold;
-namespace xrpc = xgc2::xrpc;
-using json = nlohmann::json;
+using namespace http_fixtures;
 using fixtures::Sink;
-using fixtures::TempDir;
 using fixtures::TickThread;
 using fixtures::wait_until;
 using std::chrono::milliseconds;
@@ -29,25 +23,11 @@ using std::chrono::seconds;
 
 namespace {
 
-std::string header(const xrpc::HttpResponse &response, const std::string &name) {
-  for (const auto &entry : response.headers)
-    if (strcasecmp(entry.first.c_str(), name.c_str()) == 0)
-      return entry.second;
-  return std::string();
-}
-
-json parse(const std::string &text) {
-  try {
-    return json::parse(text);
-  } catch (const std::exception &e) {
-    test::fail(__FILE__, __LINE__, std::string("not JSON: ") + e.what() + ": " + text);
-    return json();
-  }
-}
-
+// {"error":{"code","message"}}, with "details" only where the service has some to give.
 bool is_envelope(const xrpc::HttpResponse &response, const std::string &code) {
   const json body = parse(response.body);
-  return body.is_object() && body.size() == 1 && body.count("error") == 1 && body["error"].size() == 2 &&
+  return body.is_object() && body.size() == 1 && body.count("error") == 1 && body["error"].is_object() &&
+         (body["error"].size() == 2 || (body["error"].size() == 3 && body["error"].count("details") == 1)) &&
          body["error"]["code"] == code && body["error"]["message"].is_string() &&
          !body["error"]["message"].get<std::string>().empty() &&
          header(response, "Content-Type").find("application/json") == 0;
@@ -68,20 +48,15 @@ struct Rig {
     options.domain.instance_id = xrpc::new_instance_id();  // the identity of the http host, shared with the domain
     hold = std::make_unique<ChassisHold>(options, sink);
     adapter = std::make_unique<HttpAdapter>(hold->service());
-    socket = dir.path() + "/hold.sock";
-    xrpc::UnixOptions endpoint;
-    endpoint.path = socket;
-    server = std::make_unique<xrpc::HttpServer>(
-        endpoint, [this](xrpc::HttpRequest request, xrpc::HttpReply reply) { dispatch(std::move(request), std::move(reply)); },
-        xrpc::HttpLimits{}, xrpc::HttpIdentity{hold->instance_id(), {"/v1/describe"}});
-    loop = std::thread([this] { server->run(); });
+    host = std::make_unique<HttpHost>(hold->instance_id(), [this](xrpc::HttpRequest request, xrpc::HttpReply reply) {
+      dispatch(std::move(request), std::move(reply));
+    });
     if (rig.tick)
       start_ticker();
   }
   ~Rig() {
     ticker.reset();
-    server->request_stop();
-    loop.join();
+    host.reset();
   }
 
   void start_ticker() { ticker = std::make_unique<TickThread>([this] { hold->tick(); }); }
@@ -103,17 +78,7 @@ struct Rig {
 
   xrpc::HttpResponse call(const std::string &verb, const std::string &target, const std::string &body = "{}",
                           milliseconds timeout = seconds(5), const std::string &pin = std::string()) {
-    xrpc::HttpClient client(socket, xrpc::HttpLimits{}, pin.empty() ? hold->instance_id() : pin);
-    return call_with(client, verb, target, body, timeout);
-  }
-  static xrpc::HttpResponse call_with(xrpc::HttpClient &client, const std::string &verb, const std::string &target,
-                                      const std::string &body, milliseconds timeout) {
-    xrpc::HttpRequest request;
-    request.method = verb;
-    request.target = target;
-    request.body = body;
-    request.headers.emplace_back("Content-Type", "application/json");
-    return client.call(std::move(request), xrpc::Clock::now() + timeout);
+    return host->call(verb, target, body, timeout, pin);
   }
   xrpc::HttpResponse post(const std::string &method, const std::string &body = "{}",
                           milliseconds timeout = seconds(5)) {
@@ -125,15 +90,12 @@ struct Rig {
         .dump();
   }
 
-  // Destruction order: the tick thread, the server, the adapter, the hold, the sink, the directory.
-  TempDir dir;
+  // Destruction order: the tick thread, the host, the adapter, the hold, the sink.
   Sink sink;
   HoldOptions options;
   std::unique_ptr<ChassisHold> hold;
   std::unique_ptr<HttpAdapter> adapter;
-  std::string socket;
-  std::unique_ptr<xrpc::HttpServer> server;
-  std::thread loop;
+  std::unique_ptr<HttpHost> host;
   std::unique_ptr<TickThread> ticker;
   std::atomic<int> left_to_the_host{0};
 };
@@ -212,6 +174,8 @@ TEST(errors_use_the_xrpc_envelope_and_the_http_statuses_of_the_vocabulary) {
   CHECK_EQ(missing.status, 404);
   CHECK(is_envelope(missing, "not_found"));
   CHECK(parse(missing.body)["error"]["message"].get<std::string>().find("nobody") != std::string::npos);
+  REQUIRE(parse(missing.body)["error"]["details"]["robot_ids"].size() == 1);  // what the service knows is kept
+  CHECK_EQ(parse(missing.body)["error"]["details"]["robot_ids"][0].get<std::string>(), "nobody");
 
   CHECK_EQ(rig.left_to_the_host.load(), 0);
 }
@@ -356,7 +320,7 @@ TEST(closing_the_host_with_a_reply_pending_is_harmless) {
   options.service.reply_wait = seconds(5);
   auto rig = std::make_unique<Rig>(options);
   std::atomic<bool> failed{false};
-  const std::string socket = rig->socket;
+  const std::string socket = rig->host->socket();
   const std::string instance = rig->hold->instance_id();
   std::thread caller([&] {
     try {
@@ -371,7 +335,7 @@ TEST(closing_the_host_with_a_reply_pending_is_harmless) {
     }
   });
   CHECK(wait_until([&] { return rig->hold->domain().state({"gz-1"}).robots[0].held; }));
-  rig.reset();  // the server closes first, then the adapter and the service complete the waiting reply
+  rig.reset();  // the host closes first, then the adapter and the service complete the waiting reply
   caller.join();
   CHECK(failed.load());
 }
