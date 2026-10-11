@@ -37,6 +37,16 @@ void operator delete[](void *pointer) noexcept { std::free(pointer); }
 void operator delete(void *pointer, std::size_t) noexcept { std::free(pointer); }
 void operator delete[](void *pointer, std::size_t) noexcept { std::free(pointer); }
 
+// Every form must pair with malloc and free, or a sanitizer that supplies its own nothrow variants (the state
+// machine library allocates with them) reports new/free mismatches.
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  allocation::record();
+  return std::malloc(size ? size : 1);
+}
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept { return ::operator new(size, std::nothrow); }
+void operator delete(void *pointer, const std::nothrow_t &) noexcept { std::free(pointer); }
+void operator delete[](void *pointer, const std::nothrow_t &) noexcept { std::free(pointer); }
+
 void *operator new(std::size_t size, std::align_val_t alignment) {
   allocation::record();
   void *pointer = nullptr;
@@ -45,6 +55,16 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
   throw std::bad_alloc();
 }
 void *operator new[](std::size_t size, std::align_val_t alignment) { return ::operator new(size, alignment); }
+void *operator new(std::size_t size, std::align_val_t alignment, const std::nothrow_t &) noexcept {
+  allocation::record();
+  void *pointer = nullptr;
+  return posix_memalign(&pointer, static_cast<std::size_t>(alignment), size ? size : 1) == 0 ? pointer : nullptr;
+}
+void *operator new[](std::size_t size, std::align_val_t alignment, const std::nothrow_t &) noexcept {
+  return ::operator new(size, alignment, std::nothrow);
+}
+void operator delete(void *pointer, std::align_val_t, const std::nothrow_t &) noexcept { std::free(pointer); }
+void operator delete[](void *pointer, std::align_val_t, const std::nothrow_t &) noexcept { std::free(pointer); }
 void operator delete(void *pointer, std::align_val_t) noexcept { std::free(pointer); }
 void operator delete[](void *pointer, std::align_val_t) noexcept { std::free(pointer); }
 void operator delete(void *pointer, std::size_t, std::align_val_t) noexcept { std::free(pointer); }
