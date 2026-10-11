@@ -1,11 +1,19 @@
 @PACKAGE_INIT@
 
-# Components: core (domain, JSON service and facade) and udp (udp.v1 endpoint and the xgc2-hold tool, present when the
-# package was built with it).
+include(CMakeFindDependencyMacro)
+
+# Components: core (domain, JSON service and facade), udp (udp.v1 endpoint and the xgc2-hold tool) and http (adapter for an
+# xrpc http.v1 host). udp and http are present when the package was built with them.
 include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldCoreTargets.cmake")
 set(XgcChassisHold_core_FOUND TRUE)
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldUdpTargets.cmake")
   include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldUdpTargets.cmake")
   set(XgcChassisHold_udp_FOUND TRUE)
+endif()
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldHttpTargets.cmake")
+  # The header of the adapter names xrpc types: consumers get the xrpc http component with it.
+  find_dependency(XgcXrpc 0.1.0 COMPONENTS http)
+  include("${CMAKE_CURRENT_LIST_DIR}/XgcChassisHoldHttpTargets.cmake")
+  set(XgcChassisHold_http_FOUND TRUE)
 endif()
 check_required_components(XgcChassisHold)

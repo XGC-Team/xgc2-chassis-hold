@@ -10,7 +10,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
   find_package(Threads REQUIRED)
   find_package(XgcNlohmannJson REQUIRED)
-  find_package(XgcChassisHold 0.2.0 CONFIG REQUIRED COMPONENTS core udp)
+  find_package(XgcChassisHold 0.2.0 CONFIG REQUIRED COMPONENTS core udp OPTIONAL_COMPONENTS http)
   find_package(XgcXrpc 0.1.0 CONFIG REQUIRED COMPONENTS udp)
   find_program(XGC2_HOLD_CLI xgc2-hold)
   if(NOT XGC2_HOLD_CLI)
@@ -61,5 +61,19 @@ if(TARGET XgcChassisHold::udp)
   endif()
   add_test(NAME chassis_hold_cli_test COMMAND chassis_hold_cli_test ${_xgc2_hold_cli})
   set_tests_properties(chassis_hold_cli_test PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
+# The http.v1 adapter on a real xrpc http host over a Unix socket; $TMPDIR holds the socket directories of the tests.
+if(TARGET XgcChassisHold::http)
+  add_executable(chassis_hold_http_adapter_test http_adapter_test.cpp)
+  target_link_libraries(chassis_hold_http_adapter_test PRIVATE XgcChassisHold::http nlohmann_json::nlohmann_json
+    Threads::Threads)
+  target_compile_options(chassis_hold_http_adapter_test PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(chassis_hold_http_adapter_test PRIVATE -Werror)
+  endif()
+  add_test(NAME chassis_hold_http_adapter_test COMMAND chassis_hold_http_adapter_test)
+  set_tests_properties(chassis_hold_http_adapter_test PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")
 endif()

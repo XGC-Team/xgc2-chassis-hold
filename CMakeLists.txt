@@ -6,6 +6,7 @@ include(CTest)
 
 option(XGC2_CHASSIS_HOLD_WERROR "Treat compiler warnings as errors" OFF)
 option(XGC2_CHASSIS_HOLD_BUILD_UDP "Build component udp: the udp.v1 endpoint and the xgc2-hold tool (needs XgcXrpc udp)" ON)
+option(XGC2_CHASSIS_HOLD_BUILD_HTTP "Build component http: the http.v1 adapter for an xrpc http host (needs XgcXrpc http, so Boost >= 1.70: not on bionic)" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -57,11 +58,34 @@ if(XGC2_CHASSIS_HOLD_BUILD_UDP)
   install(TARGETS xgc2-hold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+# Component http: the adapter that serves the capability on an existing xrpc http.v1 host (world hosts). Its header
+# names xrpc types, so XgcXrpc::http is part of its interface.
+if(XGC2_CHASSIS_HOLD_BUILD_HTTP)
+  find_package(XgcXrpc 0.1.0 CONFIG REQUIRED COMPONENTS http)
+  add_library(xgc2_chassis_hold_http SHARED src/http_adapter.cpp)
+  add_library(XgcChassisHold::http ALIAS xgc2_chassis_hold_http)
+  set_target_properties(xgc2_chassis_hold_http PROPERTIES EXPORT_NAME http VERSION ${PROJECT_VERSION} SOVERSION 1
+    INSTALL_RPATH "$ORIGIN")
+  target_link_libraries(xgc2_chassis_hold_http PUBLIC xgc2_chassis_hold XgcXrpc::http
+    PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
+  target_compile_options(xgc2_chassis_hold_http PRIVATE -Wall -Wextra -Wpedantic)
+  if(XGC2_CHASSIS_HOLD_WERROR)
+    target_compile_options(xgc2_chassis_hold_http PRIVATE -Werror)
+  endif()
+  install(TARGETS xgc2_chassis_hold_http EXPORT XgcChassisHoldHttpTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(EXPORT XgcChassisHoldHttpTargets NAMESPACE XgcChassisHold:: FILE XgcChassisHoldHttpTargets.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcChassisHold)
+endif()
+
 # Headers of the components that were built.
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  PATTERN "udp_endpoint.hpp" EXCLUDE)
+  PATTERN "udp_endpoint.hpp" EXCLUDE PATTERN "http_adapter.hpp" EXCLUDE)
 if(XGC2_CHASSIS_HOLD_BUILD_UDP)
   install(FILES include/xgc2/chassis_hold/udp_endpoint.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/chassis_hold)
+endif()
+if(XGC2_CHASSIS_HOLD_BUILD_HTTP)
+  install(FILES include/xgc2/chassis_hold/http_adapter.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/chassis_hold)
 endif()
 install(DIRECTORY contracts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/xgc2-chassis-hold/contracts)
 configure_package_config_file(cmake/XgcChassisHoldConfig.cmake.in
