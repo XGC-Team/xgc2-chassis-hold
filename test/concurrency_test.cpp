@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <future>
 #include <thread>
@@ -25,15 +26,7 @@ using std::chrono::seconds;
 
 namespace {
 
-bool wait_until(const std::function<bool()> &condition, milliseconds timeout) {
-  const auto end = Clock::now() + timeout;
-  while (!condition()) {
-    if (Clock::now() > end)
-      return false;
-    std::this_thread::sleep_for(microseconds(100));
-  }
-  return true;
-}
+using fixtures::wait_until;
 
 // Threads of a test cannot REQUIRE: report and return an empty state instead.
 RobotState get(const Domain &domain, const std::string &id) {
@@ -118,7 +111,8 @@ TEST(engage_and_release_while_ticks_run) {
     }
   });
 
-  // A model that is deleted and created again keeps its HOLD.
+  // A model that is deleted and created again keeps its HOLD. Its releases are not waited for: the next round
+  // engages it again, in the queue behind the release, and the gate must stay closed through all of it.
   std::thread churn([&] {
     domain.add("model");
     for (int i = 0; i < 150; ++i) {
@@ -138,8 +132,8 @@ TEST(engage_and_release_while_ticks_run) {
 
   for (int round = 0; round < 150; ++round) {
     for (int i = 0; i < robots; ++i) {
-      const auto result = domain.engage({ids[i]});
-      CHECK_EQ(result[0].outcome, Outcome::engaged);
+      const Pending engaged = domain.engage({ids[i]});
+      CHECK_EQ(engaged.results()[0].outcome, Outcome::engaged);
       set_phase(i, 1);
       // The gate is effective for this thread right away.
       CHECK(!domain.admit(ids[i], domain.now()));
@@ -150,8 +144,9 @@ TEST(engage_and_release_while_ticks_run) {
 
       set_phase(i, 2);
       const TimeNs before_release = domain.now();
-      const auto released = domain.release(domain.instance_id(), {{ids[i], get(domain, ids[i]).revision}});
-      CHECK_EQ(released[0].outcome, Outcome::released);
+      const Pending released = domain.release(domain.instance_id(), {{ids[i], get(domain, ids[i]).revision}});
+      CHECK(wait_until([&] { return released.done(); }, seconds(10)));  // the tick applies it
+      CHECK_EQ(released.results()[0].outcome, Outcome::released);
       set_phase(i, 0);
       // Commands received before the release call are dropped, later ones are admitted.
       CHECK(!domain.admit(ids[i], before_release));
@@ -278,13 +273,59 @@ TEST(async_engage_replies_under_concurrent_ticks) {
   CHECK_EQ(zeroed.load(), clients * 60);
 }
 
-// A device write that does not return must not hold up the gate, the other operations or the replies.
+// A fault reported by the host engages the robot and sets the fault in one step of the machine's queue. A release
+// that races it, at any point, can neither undo the hold nor swallow the fault.
+TEST(a_release_cannot_come_between_a_fault_and_its_engage) {
+  Domain domain;
+  domain.add("a");
+  Sink sink;
+  TickThread ticker(domain, sink);
+  std::atomic<bool> stop{false};
+  std::thread releaser([&] {
+    std::deque<Pending> outstanding;
+    while (!stop) {
+      outstanding.push_back(domain.release(domain.instance_id(), {{"a", get(domain, "a").revision}}));
+      if (outstanding.size() >= 32) {  // the machine's inbox is bounded: keep the backlog small
+        wait_until([&] { return outstanding.front().done(); }, seconds(10));
+        outstanding.pop_front();
+      }
+    }
+    for (const auto &pending : outstanding)
+      wait_until([&] { return pending.done(); }, seconds(10));
+  });
+  std::atomic<bool> invariant{true};
+  std::thread reader([&] {
+    while (!stop) {
+      const RobotState state = get(domain, "a");
+      if (!state.fault.empty() && !state.held)
+        invariant = false;
+    }
+  });
+
+  for (int round = 0; round < 200; ++round) {
+    CHECK(domain.set_fault("a", "bus off"));
+    CHECK(wait_until([&] { return get(domain, "a").fault == "bus off"; }, seconds(10)));
+    CHECK(get(domain, "a").held);
+    CHECK(!domain.admit("a", domain.now()));
+    CHECK(domain.set_fault("a", ""));
+    CHECK(wait_until([&] { return get(domain, "a").fault.empty(); }, seconds(10)));
+  }
+  stop = true;
+  releaser.join();
+  reader.join();
+  CHECK(invariant.load());
+  CHECK(get(domain, "a").fault.empty());
+}
+
+// A device write that does not return must not hold up the gate, the other operations or the replies. What it does
+// hold up is the machine: a release needs the tick, so it fails instead of waiting for a device that is stuck.
 TEST(a_stuck_device_write_does_not_delay_the_gate) {
   Domain domain;
   domain.add("a");
   domain.add("b");
   ServiceOptions options;
   options.reply_wait = milliseconds(100);
+  options.release_wait = milliseconds(150);
   Service service(domain, options);
   Sink sink;
   std::atomic<bool> unblock{false};
@@ -304,16 +345,29 @@ TEST(a_stuck_device_write_does_not_delay_the_gate) {
   CHECK(!domain.admit("a", domain.now()));
   CHECK(elapsed < seconds(5));
   CHECK_EQ(json::parse(engage.body)["robots"][0]["stage"].get<std::string>(), "gated");  // honest: no zero yet
+  CHECK_EQ(json::parse(engage.body)["robots"][0]["revision"].get<std::uint64_t>(), 1);
   CHECK_EQ(service.call("State", "").status, Status::ok);
   CHECK(domain.admit("zz", domain.now()) == false);
-  const auto released = domain.release(domain.instance_id(), {{"a", 1}});
-  CHECK_EQ(released[0].outcome, Outcome::released);
-  domain.engage({"a"});
+
+  // The release cannot be applied while the tick is stuck: the call fails and nothing is released, now or later.
+  const std::string release = "{\"expected_instance\":\"" + domain.instance_id() +
+                              "\",\"changes\":[{\"robot_id\":\"a\",\"expected_revision\":1}]}";
+  const ServiceReply failed = service.call("Release", release);
+  CHECK_EQ(failed.status, Status::deadline_exceeded);
   CHECK(!domain.admit("a", domain.now()));
+  CHECK(get(domain, "a").held);
 
   unblock = true;
   CHECK(wait_until([&] { return get(domain, "a").stage == Stage::zero_written; }, seconds(10)));
   CHECK(wait_until([&] { return get(domain, "b").stage == Stage::zero_written; }, seconds(10)));
+  CHECK(get(domain, "a").held);  // the release that gave up was not applied when the tick came back
+  CHECK(!domain.admit("a", domain.now()));
+
+  // With the tick running again the same release goes through.
+  const ServiceReply done = service.call("Release", release);
+  CHECK_EQ(done.status, Status::ok);
+  CHECK_EQ(json::parse(done.body)["robots"][0]["outcome"].get<std::string>(), "released");
+  CHECK(domain.admit("a", domain.now()));
 }
 
 TEST_MAIN()

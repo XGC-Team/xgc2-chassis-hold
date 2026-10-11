@@ -13,15 +13,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(Threads REQUIRED)
 find_package(XgcNlohmannJson REQUIRED)
+find_package(xgc2_state_machine 0.1.3 CONFIG REQUIRED)
 
-# Component core: the domain and the transport-neutral JSON service. Needs the C++ standard library and
-# nlohmann-json at build time only; no header exposes it.
-add_library(xgc2_chassis_hold SHARED src/domain.cpp src/service.cpp)
+# Component core: the domain (a state machine per robot) and the transport-neutral JSON service. Needs the
+# xgc2-state-machine library and, at build time only, nlohmann-json; no header exposes either.
+add_library(xgc2_chassis_hold SHARED src/domain.cpp src/hold_machine.cpp src/service.cpp)
 add_library(XgcChassisHold::core ALIAS xgc2_chassis_hold)
 set_target_properties(xgc2_chassis_hold PROPERTIES EXPORT_NAME core VERSION ${PROJECT_VERSION} SOVERSION 1)
 target_include_directories(xgc2_chassis_hold PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(xgc2_chassis_hold PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(xgc2_chassis_hold PRIVATE xgc2_state_machine::state_machine nlohmann_json::nlohmann_json Threads::Threads)
 target_compile_options(xgc2_chassis_hold PRIVATE -Wall -Wextra -Wpedantic)
 if(XGC2_CHASSIS_HOLD_WERROR)
   target_compile_options(xgc2_chassis_hold PRIVATE -Werror)

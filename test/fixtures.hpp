@@ -19,6 +19,18 @@ using xgc2::chassis_hold::TimeNs;
 
 constexpr TimeNs ms = 1000000;
 
+// Polls until the condition holds or the timeout ends; false on timeout.
+inline bool wait_until(const std::function<bool()> &condition,
+                       std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
+  const auto end = std::chrono::steady_clock::now() + timeout;
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() > end)
+      return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  return true;
+}
+
 // A domain clock the test advances by hand.
 struct FakeClock {
   std::atomic<TimeNs> ns{1000 * ms};

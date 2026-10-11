@@ -15,13 +15,16 @@ inline constexpr const char *service_name = "xgc2.chassis.hold";
 
 // Reply status. The values are the udp.v1 status codes (xrpc.md 5.3); http.v1 hosts map the names with their
 // usual table. Errors carry the body {"code":"<name>","message":"..."}.
-enum class Status : std::uint32_t { ok = 0, invalid_argument = 1, not_found = 2, internal = 8 };
+enum class Status : std::uint32_t { ok = 0, invalid_argument = 1, not_found = 2, deadline_exceeded = 5, internal = 8 };
 const char *to_string(Status) noexcept;
 
 struct ServiceOptions {
   // How long Engage waits for the native tick to write zero before it replies (never longer than the call
-  // deadline). 0 replies at once with the stage the gate has reached.
+  // deadline). 0 replies at once with what the gate decided: the robot is held and gated.
   std::chrono::milliseconds reply_wait{60};
+  // How long Release waits for the native tick to apply it (never longer than the call deadline). A release that
+  // the tick has not applied by then is not applied at all and the call fails with deadline_exceeded.
+  std::chrono::milliseconds release_wait{2000};
   // Robot ids per request; "all" and an empty State selection are refused for a larger roster. Keeps replies
   // small enough for one udp.v1 datagram on single-robot hosts and bounded everywhere else.
   std::size_t max_ids = 64;
@@ -30,7 +33,8 @@ struct ServiceOptions {
 
 struct ServiceReply {
   Status status = Status::ok;
-  std::string body;  // UTF-8 JSON
+  std::string body;     // UTF-8 JSON; for an error the udp.v1 error body {"code","message","details"}
+  std::string message;  // the message of an error, empty when ok (http.v1 hosts put it in their own envelope)
 };
 
 // The domain must outlive the service. All methods are thread safe.
@@ -40,7 +44,7 @@ public:
   using Callback = std::function<void(ServiceReply)>;
 
   explicit Service(Domain &domain, ServiceOptions options = {});
-  // Completes pending engage replies with the state reached so far.
+  // Completes pending replies: an engage with the state reached so far, a release as not applied.
   ~Service();
   Service(const Service &) = delete;
   Service &operator=(const Service &) = delete;
@@ -49,14 +53,16 @@ public:
   const std::string &instance_id() const noexcept;
 
   // method is one of Describe, State, Engage, Release (not found otherwise); body is the request JSON (an empty
-  // body is {}). Engage blocks the calling thread for at most reply_wait; do not call it from the tick thread.
+  // body is {}). Engage and Release block the calling thread until the tick has applied them, for at most
+  // reply_wait and release_wait; do not call them from the tick thread.
   ServiceReply call(const std::string &method, const std::string &body,
                     Clock::time_point deadline = Clock::time_point::max());
 
   // The same without blocking: callback runs exactly once, inline for every reply that needs no waiting, or
-  // otherwise from the service's own thread when the tick has written zero or the wait has ended. It never
-  // runs on the tick thread, so a slow transport cannot delay the control loop. The deadline bounds the engage
-  // wait only; a request that arrives after its deadline is still executed (engage is safe, release is fenced).
+  // otherwise from the service's own thread when the tick has applied the request or the wait has ended. It never
+  // runs on the tick thread, so a slow transport cannot delay the control loop. The deadline bounds the waits; a
+  // request that arrives after its deadline is still executed if it is an engage (always safe), while a release
+  // is applied only if the tick gets to it before the deadline.
   void call_async(const std::string &method, const std::string &body, Clock::time_point deadline,
                   Callback callback);
 

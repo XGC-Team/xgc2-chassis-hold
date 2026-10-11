@@ -8,6 +8,7 @@
 #include <thread>
 
 using namespace udp_fixtures;
+using fixtures::wait_until;
 
 namespace {
 
@@ -146,6 +147,33 @@ TEST(engage_without_a_tick_reports_gated_and_the_zero_follows) {
       std::this_thread::sleep_for(milliseconds(5));
   }
   CHECK_EQ(stage, "zero_written");
+}
+
+TEST(a_release_the_tick_cannot_apply_fails_with_deadline_exceeded_and_is_not_applied_later) {
+  RigOptions options;
+  options.tick = false;
+  options.service.release_wait = milliseconds(150);
+  Rig rig(options);
+  const std::string instance = rig.domain.instance_id();
+  REQUIRE(answered(rig.call("Engage", json{{"all", true}})));  // the gate closes without a tick
+
+  // Nobody ticks: the release is not applied, and the caller is told so instead of waiting for a device.
+  const auto started = std::chrono::steady_clock::now();
+  const udp::Response release = rig.call("Release", parse(rig.release_body(instance, 1)), seconds(2), instance);
+  CHECK(std::chrono::steady_clock::now() - started >= milliseconds(120));
+  CHECK(answered(release, udp::Status::DeadlineExceeded));
+  CHECK_EQ(parse(release.body)["code"].get<std::string>(), "deadline_exceeded");
+  CHECK(rig.domain.state({"ugv-1"}).robots[0].held);
+
+  // The tick starts; the release that gave up does not come back to life, and a new one goes through.
+  rig.start_ticker();
+  CHECK(wait_until([&] { return rig.domain.state({"ugv-1"}).robots[0].stage == Stage::zero_written; }));
+  CHECK(rig.domain.state({"ugv-1"}).robots[0].held);
+  CHECK(!rig.domain.admit("ugv-1", rig.domain.now()));
+  const udp::Response again = rig.call("Release", parse(rig.release_body(instance, 1)), seconds(2), instance);
+  REQUIRE(answered(again));
+  CHECK_EQ(first_outcome(parse(again.body)), "released");
+  CHECK(rig.domain.admit("ugv-1", rig.domain.now()));
 }
 
 TEST(a_reply_that_does_not_fit_a_datagram_is_refused_but_the_engage_stands) {

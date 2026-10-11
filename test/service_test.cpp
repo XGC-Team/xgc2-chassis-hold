@@ -18,6 +18,8 @@ namespace {
 
 using fixtures::FakeClock;
 using fixtures::Sink;
+using fixtures::TickThread;
+using fixtures::wait_until;
 using Clock = Service::Clock;
 using std::chrono::milliseconds;
 using std::chrono::seconds;
@@ -25,6 +27,7 @@ using std::chrono::seconds;
 ServiceOptions quick_wait() {
   ServiceOptions options;
   options.reply_wait = milliseconds(30);
+  options.release_wait = milliseconds(200);
   return options;
 }
 
@@ -146,6 +149,7 @@ TEST(state_reports_every_field) {
   CHECK_EQ(a["fault"].get<std::string>(), "zero write failed: device unplugged");
   CHECK(a["zero_written_at_ms"].is_null());
   domain.set_fault("a", "serial port lost");
+  domain.tick(sink);
   a = body_of(service.call("State", "{\"robot_ids\":[\"a\"]}"))["robots"][0];
   CHECK_EQ(a["fault"].get<std::string>(), "serial port lost");
 
@@ -293,6 +297,7 @@ TEST(a_pending_engage_ends_when_the_robot_is_released_or_removed) {
   ServiceOptions options;
   options.reply_wait = seconds(30);
   Service service(domain, options);
+  Sink sink;
 
   std::promise<ServiceReply> released_promise;
   std::promise<ServiceReply> removed_promise;
@@ -303,18 +308,20 @@ TEST(a_pending_engage_ends_when_the_robot_is_released_or_removed) {
   service.call_async("Engage", "{\"robot_ids\":[\"b\"]}", Clock::now() + seconds(60),
                      [&](ServiceReply reply) { removed_promise.set_value(std::move(reply)); });
   CHECK(released.wait_for(milliseconds(50)) == std::future_status::timeout);
+  CHECK(removed.wait_for(milliseconds(50)) == std::future_status::timeout);
 
-  domain.release(domain.instance_id(), {{"a", 1}});
+  domain.remove("b");  // nothing is left to wait for
+  REQUIRE(removed.wait_for(seconds(5)) == std::future_status::ready);
+  CHECK_EQ(body_of(removed.get())["robots"][0]["outcome"].get<std::string>(), "engaged");
+  CHECK(released.wait_for(milliseconds(50)) == std::future_status::timeout);
+
+  domain.release(domain.instance_id(), {{"a", 1}});  // queued behind the engage
+  domain.tick(sink);                                 // applies both: the robot is released when the reply is sent
   REQUIRE(released.wait_for(seconds(5)) == std::future_status::ready);
   json a = body_of(released.get())["robots"][0];
   CHECK_EQ(a["outcome"].get<std::string>(), "engaged");  // what the engage did
   CHECK(!a["held"].get<bool>());                          // what is true when the reply is sent
   CHECK_EQ(a["stage"].get<std::string>(), "released");
-
-  CHECK(removed.wait_for(milliseconds(50)) == std::future_status::timeout);
-  domain.remove("b");
-  REQUIRE(removed.wait_for(seconds(5)) == std::future_status::ready);
-  CHECK_EQ(body_of(removed.get())["robots"][0]["outcome"].get<std::string>(), "engaged");
 }
 
 TEST(destroying_the_service_completes_pending_replies) {
@@ -364,8 +371,10 @@ TEST(release_applies_the_compare_and_set) {
   domain.add("a");
   domain.add("b");
   Service service(domain, quick_wait());
+  Sink sink;
+  TickThread ticker(domain, sink);
   const std::string instance = domain.instance_id();
-  domain.engage({"a", "b"});
+  CHECK_EQ(service.call("Engage", "{\"robot_ids\":[\"a\",\"b\"]}").status, Status::ok);
 
   const std::string changes =
       "[{\"robot_id\":\"a\",\"expected_revision\":1},{\"robot_id\":\"b\",\"expected_revision\":7},"
@@ -402,6 +411,52 @@ TEST(release_applies_the_compare_and_set) {
   CHECK(domain.state({"b"}).robots[0].held);
 }
 
+TEST(a_release_waits_for_the_tick_and_is_not_applied_after_its_call_gave_up) {
+  Domain domain;
+  domain.add("a");
+  ServiceOptions options;
+  options.reply_wait = milliseconds(0);
+  options.release_wait = milliseconds(60);
+  Service service(domain, options);
+  Sink sink;
+  const std::string instance = domain.instance_id();
+  const std::string release = release_body(instance, "[{\"robot_id\":\"a\",\"expected_revision\":1}]");
+  domain.engage({"a"});
+  domain.tick(sink);  // this thread is the tick thread, and it stops ticking for now
+
+  // Nobody ticks: the release cannot be applied, the call fails, and the robot stays held.
+  const auto started = Clock::now();
+  const ServiceReply failed = service.call("Release", release);
+  CHECK(Clock::now() - started >= milliseconds(50));
+  CHECK_EQ(failed.status, Status::deadline_exceeded);
+  CHECK_EQ(body_of(failed)["code"].get<std::string>(), "deadline_exceeded");
+  CHECK(domain.state({"a"}).robots[0].held);
+  CHECK(!domain.admit("a", domain.now()));
+
+  // The tick comes back: the release that gave up is not applied late.
+  domain.tick(sink);
+  CHECK(domain.state({"a"}).robots[0].held);
+  CHECK(!domain.admit("a", domain.now()));
+
+  // A release the tick gets to goes through; the reply comes from the service thread, not the tick thread.
+  std::promise<ServiceReply> promise;
+  std::future<ServiceReply> future = promise.get_future();
+  std::thread::id callback_thread;
+  options.release_wait = seconds(10);
+  Service patient(domain, options);
+  patient.call_async("Release", release, Clock::now() + seconds(20), [&](ServiceReply reply) {
+    callback_thread = std::this_thread::get_id();
+    promise.set_value(std::move(reply));
+  });
+  CHECK(future.wait_for(milliseconds(50)) == std::future_status::timeout);
+  domain.tick(sink);
+  REQUIRE(future.wait_for(seconds(5)) == std::future_status::ready);
+  CHECK(callback_thread != std::this_thread::get_id());
+  const ServiceReply done = future.get();
+  CHECK_EQ(done.status, Status::ok);
+  CHECK_EQ(body_of(done)["robots"][0]["outcome"].get<std::string>(), "released");
+}
+
 TEST(requests_are_closed_schemas) {
   Domain domain;
   domain.add("a");
@@ -410,6 +465,8 @@ TEST(requests_are_closed_schemas) {
   options.max_ids = 3;
   options.max_body_bytes = 600;
   Service service(domain, options);
+  Sink sink;
+  TickThread ticker(domain, sink);  // a valid release waits for it
   const std::string instance = domain.instance_id();
   const std::string change = "{\"robot_id\":\"a\",\"expected_revision\":1}";
 
@@ -562,9 +619,10 @@ TEST(replies_for_a_single_robot_fit_one_datagram) {
   Service service(domain, quick_wait());
   Sink sink;
   sink.fail(id, true);
+  TickThread ticker(domain, sink);
   domain.engage({id});
-  domain.tick(sink);
   domain.set_fault(id, std::string(500, 'f'));
+  REQUIRE(wait_until([&] { return !domain.state({id}).robots[0].fault.empty(); }));
 
   const std::string ids = "[\"" + id + "\"]";
   const ServiceReply describe = service.call("Describe", "{}");
@@ -577,6 +635,7 @@ TEST(replies_for_a_single_robot_fit_one_datagram) {
     CHECK_EQ(reply->status, Status::ok);
     CHECK(reply->body.size() < 900);
   }
+  CHECK_EQ(body_of(release)["robots"][0]["outcome"].get<std::string>(), "conflict");  // a fault holds the robot
 }
 
 TEST(body_size_limit_is_inclusive_and_options_are_validated) {
@@ -623,6 +682,8 @@ TEST(mutated_requests_are_answered_safely) {
   options.reply_wait = milliseconds(0);
   options.max_ids = 4;
   Service service(domain, options);
+  Sink sink;
+  TickThread ticker(domain, sink);  // the valid releases wait for it
   const std::string instance = domain.instance_id();
   const std::vector<std::pair<std::string, std::string>> seeds = {
       {"Describe", "{}"},

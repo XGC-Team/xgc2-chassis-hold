@@ -1,5 +1,7 @@
 #include <xgc2/chassis_hold/service.hpp>
 
+#include "text.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -241,13 +243,13 @@ json result_json(const RobotResult &result) {
   return j;
 }
 
-ServiceReply ok(const json &body) { return {Status::ok, body.dump()}; }
+ServiceReply ok(const json &body) { return {Status::ok, body.dump(), std::string()}; }
 
 ServiceReply error_reply(Status status, const std::string &message) {
   json j;
   j["code"] = to_string(status);
   j["message"] = message;
-  return {status, j.dump()};
+  return {status, j.dump(), message};
 }
 
 ServiceReply mutation_reply(const std::string &instance, const std::vector<RobotResult> &results) {
@@ -266,16 +268,18 @@ const char *to_string(Status status) noexcept {
     case Status::ok: return "ok";
     case Status::invalid_argument: return "invalid_argument";
     case Status::not_found: return "not_found";
+    case Status::deadline_exceeded: return "deadline_exceeded";
     case Status::internal: return "internal";
   }
   return "internal";
 }
 
 struct Service::Impl {
-  // An engage whose robots have not all been zeroed by the tick yet.
+  // An engage or release that the tick has not applied yet, or an engage whose robots are not all zeroed yet.
   struct Waiter {
-    std::vector<RobotResult> results;
-    std::vector<std::string> ids;  // robots in results that exist
+    Pending pending;
+    bool release = false;
+    std::vector<std::string> ids;  // robots of the request that exist
     Clock::time_point until;
     Callback callback;
   };
@@ -290,7 +294,8 @@ struct Service::Impl {
 
   Impl(Domain &domain_in, ServiceOptions options_in)
       : domain(domain_in), options(std::move(options_in)), shared(std::make_shared<Shared>()) {
-    if (options.reply_wait.count() < 0 || options.reply_wait > std::chrono::hours(1) || options.max_ids == 0 ||
+    if (options.reply_wait.count() < 0 || options.reply_wait > std::chrono::hours(1) ||
+        options.release_wait.count() < 0 || options.release_wait > std::chrono::hours(1) || options.max_ids == 0 ||
         options.max_body_bytes < 2)
       throw std::invalid_argument("invalid chassis hold service options");
     auto wake_target = shared;
@@ -323,7 +328,7 @@ struct Service::Impl {
       rest.swap(shared->waiters);
     }
     for (auto &waiter : rest)
-      deliver(waiter.callback, finish_engage(waiter.results));
+      deliver(waiter.callback, finish(waiter));
   }
 
   static void deliver(Callback &callback, ServiceReply reply) {
@@ -334,8 +339,12 @@ struct Service::Impl {
     }
   }
 
-  // True once every robot of the waiter is past the gated stage, released, or gone.
-  bool zero_settled(const Waiter &waiter) const {
+  // A release is settled once the tick has applied it. An engage is settled once no robot of it waits for its zero
+  // any more: a robot that is zeroed already (or was released or removed meanwhile) does not, and for one that is
+  // not held yet the gate has decided what the reply says.
+  bool settled(const Waiter &waiter) const {
+    if (waiter.release)
+      return waiter.pending.done();
     const Snapshot snapshot = domain.state(waiter.ids);
     for (const auto &state : snapshot.robots)
       if (state.held && state.stage == Stage::gated)
@@ -343,27 +352,23 @@ struct Service::Impl {
     return true;
   }
 
-  // The reply reports the state at the time it is sent, with the outcome each robot got from the engage.
-  ServiceReply finish_engage(std::vector<RobotResult> &results) const {
-    std::vector<std::string> ids;
-    for (const auto &result : results)
-      if (result.state)
-        ids.push_back(result.robot_id);
-    if (!ids.empty()) {
-      const Snapshot snapshot = domain.state(ids);
-      for (auto &result : results) {
-        if (!result.state)
-          continue;
-        for (const auto &state : snapshot.robots)
-          if (state.robot_id == result.robot_id)
-            result.state = state;
-      }
+  // The reply reports the state at the time it is sent, with the outcome each robot got from the machine (an
+  // engage the tick has not applied reports what the gate decided; a release it has not applied fails).
+  ServiceReply finish(const Waiter &waiter) const {
+    const std::vector<RobotResult> results = waiter.pending.results();
+    if (waiter.release) {
+      const bool applied = waiter.pending.done();
+      bool expired = !applied;
+      for (const auto &result : results)
+        expired = expired || result.outcome == Outcome::expired;
+      if (expired)
+        return error_reply(Status::deadline_exceeded, "the native tick did not apply the release in time; nothing was released");
     }
     return mutation_reply(domain.instance_id(), results);
   }
 
-  // The service thread: completes waiters when the tick has written zero (the domain listener wakes it) or
-  // their wait ends.
+  // The service thread: completes waiters when the tick has applied them (the domain listener wakes it) or their
+  // wait ends.
   void run() {
     std::unique_lock<std::mutex> lock(shared->mutex);
     while (!shared->stop) {
@@ -372,8 +377,8 @@ struct Service::Impl {
       auto next = Clock::time_point::max();
       const auto now = Clock::now();
       for (auto it = shared->waiters.begin(); it != shared->waiters.end();) {
-        if (it->until <= now || zero_settled(*it)) {
-          done.emplace_back(std::move(it->callback), finish_engage(it->results));
+        if (it->until <= now || settled(*it)) {
+          done.emplace_back(std::move(it->callback), finish(*it));
           it = shared->waiters.erase(it);
         } else {
           next = std::min(next, it->until);
@@ -394,29 +399,41 @@ struct Service::Impl {
     }
   }
 
-  void engage(const EngageRequest &request, Clock::time_point deadline, Callback &callback) {
-    std::vector<RobotResult> results = request.all ? domain.engage_all() : domain.engage(request.ids);
-    bool waiting = false;
-    std::vector<std::string> ids;
-    for (const auto &result : results) {
-      if (!result.state)
-        continue;
-      ids.push_back(result.robot_id);
-      waiting = waiting || (result.state->held && result.state->stage == Stage::gated);
-    }
-    const auto until = std::min(Clock::now() + options.reply_wait, deadline);
-    if (waiting && until > Clock::now()) {
+  // Hands the request to the worker, or answers at once when there is nothing to wait for.
+  void wait_for(Waiter waiter, Callback &callback) {
+    if (waiter.until > Clock::now() && !settled(waiter)) {
       std::unique_lock<std::mutex> lock(shared->mutex);
       if (shared->waiters.size() < max_pending_replies) {
-        shared->waiters.push_back({std::move(results), std::move(ids), until, std::move(callback)});
-        // The tick may have written zero between the engage and here: have the thread look at once.
+        waiter.callback = std::move(callback);
+        shared->waiters.push_back(std::move(waiter));
+        // The tick may have applied it between the check and here: have the thread look at once.
         shared->wake = true;
         lock.unlock();
         shared->changed.notify_one();
         return;
       }
     }
-    deliver(callback, finish_engage(results));
+    deliver(callback, finish(waiter));
+  }
+
+  void engage(const EngageRequest &request, Clock::time_point deadline, Callback &callback) {
+    Waiter waiter;
+    waiter.pending = request.all ? domain.engage_all() : domain.engage(request.ids);
+    for (const auto &result : waiter.pending.results())
+      if (result.state)
+        waiter.ids.push_back(result.robot_id);
+    waiter.until = std::min(Clock::now() + options.reply_wait, deadline);
+    wait_for(std::move(waiter), callback);
+  }
+
+  void release(const ReleaseRequest &request, Clock::time_point deadline, Callback &callback) {
+    Waiter waiter;
+    waiter.release = true;
+    waiter.until = std::min(Clock::now() + options.release_wait, deadline);
+    // The machines apply the release only if the tick gets to it before the call gives up.
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(waiter.until - Clock::now());
+    waiter.pending = domain.release(request.expected_instance, request.changes, domain.now() + left.count());
+    wait_for(std::move(waiter), callback);
   }
 
   void dispatch(const std::string &method, const std::string &body, Clock::time_point deadline,
@@ -445,11 +462,14 @@ struct Service::Impl {
           invalid("the roster has more than " + std::to_string(options.max_ids) + " robots: list robot_ids");
         const Snapshot snapshot = domain.state(ids);
         if (!snapshot.unknown.empty()) {
+          std::string listed;
+          for (const auto &id : snapshot.unknown)
+            listed += (listed.empty() ? "" : ", ") + id;
           json j;
           j["code"] = "not_found";
-          j["message"] = "unknown robot_ids";
+          j["message"] = clean_text("unknown robot_ids: " + listed);
           j["details"]["robot_ids"] = snapshot.unknown;
-          return deliver(callback, ServiceReply{Status::not_found, j.dump()});
+          return deliver(callback, ServiceReply{Status::not_found, j.dump(), j["message"].get<std::string>()});
         }
         json j;
         j["instance"] = snapshot.instance;
@@ -464,11 +484,8 @@ struct Service::Impl {
           invalid("the roster has more than " + std::to_string(options.max_ids) + " robots: list robot_ids");
         return engage(request, deadline, callback);
       }
-      if (method == "Release") {
-        const ReleaseRequest request = parse_release(parse_object(body, options), options);
-        const std::vector<RobotResult> results = domain.release(request.expected_instance, request.changes);
-        return deliver(callback, mutation_reply(domain.instance_id(), results));
-      }
+      if (method == "Release")
+        return release(parse_release(parse_object(body, options), options), deadline, callback);
       return deliver(callback, error_reply(Status::not_found, "unknown method \"" + printable(method) + "\""));
     } catch (const RequestError &e) {
       deliver(callback, error_reply(e.status, e.message));
