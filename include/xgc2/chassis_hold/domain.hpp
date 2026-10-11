@@ -59,7 +59,16 @@ struct DomainOptions {
   // release fence compares unrelated times. Called from every thread that uses the domain, sometimes with a lock
   // held: keep it cheap and non-blocking.
   std::function<TimeNs()> clock;
-  // Upper bound on distinct robot ids ever added (removed ids keep their state).
+  // Wakes the host's native loop. Called whenever something needs the tick: an engage, a release, a fault or its
+  // clearing, a robot that was added again or added held, feedback that moves a stage. A host whose control loop
+  // sleeps between cycles (a condition variable, an eventfd, HttpServer::wake) hooks it up once, instead of
+  // waking the loop at every call site. It runs on the thread that made the call (a transport's I/O thread, a
+  // host thread) after the operation took effect and without any lock of the domain, once per call and not per
+  // robot. Keep it cheap and non-blocking, and do not call engage, release or set_fault from it. An exception
+  // thrown by it is ignored: the operation has already taken effect.
+  std::function<void()> wake;
+  // Upper bound on distinct robot ids ever added to one domain (one per process): removed ids keep their state
+  // and stay counted, so this also bounds the memory a roster that churns can use.
   std::size_t max_robots = 1024;
 };
 
@@ -180,10 +189,15 @@ public:
   Snapshot state(const std::vector<std::string> &robot_ids = {}) const;
   Description describe() const;
 
-  // Host command path, for every motion command the host receives. False if the robot is unknown, held (an
-  // engage that the tick has not applied yet counts), or the command was received before the last release
-  // (receipt_time_ns < release fence): it must not be replayed. receipt_time_ns is the time the command was
-  // received, not the time it is dispatched. Wait free apart from the roster lookup.
+  // Host command path, for every motion command the host is about to execute. False if the robot is unknown,
+  // held (an engage that the tick has not applied yet counts), or the command was received before the last
+  // release (receipt_time_ns < release fence): it must not be replayed. receipt_time_ns is the time the command
+  // was received, on the domain clock, not the time it is dispatched: the stamp that the transport or the host
+  // queue recorded when the message arrived (ROS: MessageEvent::getReceiptTime(); a simulator: the time the
+  // message entered its input queue; domain.now() for a message that is handled the moment it arrives). A command
+  // that sat in a queue while the robot was held, or that arrived while the release was being applied, is
+  // refused although it is dispatched after the release: hosts need not drain their callback queues before they
+  // release. Wait free apart from the roster lookup.
   bool admit(const std::string &robot_id, TimeNs receipt_time_ns) const;
 
   // Host native tick, every control cycle on the thread that owns device output (after the command callbacks

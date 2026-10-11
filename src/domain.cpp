@@ -234,6 +234,16 @@ void DomainImpl::notify() {
       (*listener)();
 }
 
+void DomainImpl::wake() noexcept {
+  if (!options.wake)
+    return;
+  try {
+    options.wake();
+  } catch (...) {
+    // The operation that called this has taken effect; the host's wake-up is not its business.
+  }
+}
+
 }  // namespace detail
 
 bool Pending::done() const { return !operation_ || operation_->unresolved.load(std::memory_order_acquire) == 0; }
@@ -260,29 +270,30 @@ Domain::~Domain() = default;
 const std::string &Domain::instance_id() const noexcept { return impl_->options.instance_id; }
 TimeNs Domain::now() const { return impl_->now(); }
 
-bool Domain::add(const std::string &robot_id, bool feedback) {
-  if (!valid_robot_id(robot_id))
-    throw std::invalid_argument("invalid robot id");
-  std::unique_lock<std::shared_mutex> roster(impl_->roster_mutex);
-  const auto found = impl_->robots.find(robot_id);
-  if (found == impl_->robots.end()) {
-    if (impl_->robots.size() >= impl_->options.max_robots)
+bool detail::DomainImpl::add_robot(const std::string &robot_id, bool feedback, bool &needs_tick) {
+  std::unique_lock<std::shared_mutex> roster(roster_mutex);
+  const auto found = robots.find(robot_id);
+  if (found == robots.end()) {
+    if (robots.size() >= options.max_robots)
       throw std::length_error("chassis hold roster is full");
-    auto entry = std::make_unique<detail::Entry>(*impl_, robot_id);
+    auto entry = std::make_unique<detail::Entry>(*this, robot_id);
     entry->machine = detail::make_hold_machine(*entry);
     entry->active = true;
     entry->binding = 1;
     entry->state.feedback = feedback;
     detail::Entry *added = entry.get();
-    impl_->robots.emplace(robot_id, std::move(entry));
+    robots.emplace(robot_id, std::move(entry));
     // The boot hold is an engage that nobody waits for: the first tick applies it (revision 1, stage gated).
-    if (impl_->options.boot_held)
-      impl_->engage_entry(*added, nullptr, nullptr);
+    if (options.boot_held) {
+      engage_entry(*added, nullptr, nullptr);
+      needs_tick = true;
+    }
     return true;
   }
   detail::Entry &entry = *found->second;
-  const TimeNs at = impl_->now();
+  const TimeNs at = now();
   std::uint64_t binding = 0;
+  bool rebind = false;
   {
     std::lock_guard<std::mutex> lock(entry.mutex);
     if (entry.active)
@@ -290,6 +301,8 @@ bool Domain::add(const std::string &robot_id, bool feedback) {
     entry.active = true;
     binding = ++entry.binding;
     entry.state.feedback = feedback;
+    // Only a hold has anything to learn about the new device: one the machine applied, or an engage on its way.
+    rebind = entry.state.held || (entry.gate.load(std::memory_order_acquire) & ~kBrokenBit) >= kPendingUnit;
     if (entry.state.held) {
       // A held robot comes back with a new device: no zero yet, and the fault belonged to the old one. The machine
       // follows with the rebound event; State must not show the old device's progress in the meantime.
@@ -303,8 +316,21 @@ bool Domain::add(const std::string &robot_id, bool feedback) {
       entry.last_sample.reset();
     }
   }
-  impl_->post(entry, ev::Rebound, {{"binding", as_payload(binding)}, {"at", static_cast<std::int64_t>(at)}});
+  if (rebind) {
+    post(entry, ev::Rebound, {{"binding", as_payload(binding)}, {"at", static_cast<std::int64_t>(at)}});
+    needs_tick = true;
+  }
   return true;
+}
+
+bool Domain::add(const std::string &robot_id, bool feedback) {
+  if (!valid_robot_id(robot_id))
+    throw std::invalid_argument("invalid robot id");
+  bool needs_tick = false;
+  const bool added = impl_->add_robot(robot_id, feedback, needs_tick);
+  if (needs_tick)
+    impl_->wake();
+  return added;
 }
 
 bool Domain::remove(const std::string &robot_id) {
@@ -325,19 +351,25 @@ bool Domain::remove(const std::string &robot_id) {
 Pending Domain::engage(const std::vector<std::string> &robot_ids) {
   auto operation = std::make_shared<detail::Operation>();
   operation->domain = impl_.get();
-  std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
-  for (const auto &id : robot_ids) {
-    auto item = std::make_unique<detail::Item>();
-    item->robot_id = id;
-    detail::Item *raw = item.get();
-    operation->items.push_back(std::move(item));
-    if (detail::Entry *entry = impl_->find_active(id)) {
-      raw->entry = entry;
-      impl_->engage_entry(*entry, operation, raw);
-    } else {
-      raw->resolved.store(static_cast<int>(Outcome::unknown_robot));
+  bool needs_tick = false;
+  {
+    std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
+    for (const auto &id : robot_ids) {
+      auto item = std::make_unique<detail::Item>();
+      item->robot_id = id;
+      detail::Item *raw = item.get();
+      operation->items.push_back(std::move(item));
+      if (detail::Entry *entry = impl_->find_active(id)) {
+        raw->entry = entry;
+        impl_->engage_entry(*entry, operation, raw);
+        needs_tick = true;
+      } else {
+        raw->resolved.store(static_cast<int>(Outcome::unknown_robot));
+      }
     }
   }
+  if (needs_tick)
+    impl_->wake();
   return Pending(std::move(operation));
 }
 
@@ -356,41 +388,48 @@ Pending Domain::release(const std::string &expected_instance, const std::vector<
                         std::optional<TimeNs> deadline_ns) {
   auto operation = std::make_shared<detail::Operation>();
   operation->domain = impl_.get();
-  std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
-  for (const auto &change : changes) {
-    auto item = std::make_unique<detail::Item>();
-    item->robot_id = change.robot_id;
-    detail::Item *raw = item.get();
-    operation->items.push_back(std::move(item));
-    detail::Entry *entry = impl_->find_active(change.robot_id);
-    if (!entry) {
-      raw->resolved.store(static_cast<int>(Outcome::unknown_robot));
-      continue;
-    }
-    raw->entry = entry;
-    raw->provisional = Outcome::conflict;  // not applied
-    std::int64_t ticket = 0;
-    {
-      std::lock_guard<std::mutex> lock(entry->mutex);
-      operation->unresolved.fetch_add(1, std::memory_order_acq_rel);
-      ticket = entry->add_ticket(operation, raw);
-    }
-    sm::EventPayload payload;
-    payload["ticket"] = ticket;
-    payload["instance"] = expected_instance;
-    payload["revision"] = as_payload(change.expected_revision);
-    payload["deadline"] = deadline_ns ? static_cast<std::int64_t>(*deadline_ns) : no_deadline;
-    bool posted = false;
-    {
-      std::lock_guard<std::mutex> order(entry->post_order);
-      posted = impl_->post(*entry, ev::Release, std::move(payload));
-    }
-    if (!posted) {
-      impl_->fail_closed(*entry, "the event queue of the machine is full");
-      std::lock_guard<std::mutex> lock(entry->mutex);
-      entry->resolve(ticket, Outcome::conflict);
+  bool needs_tick = false;
+  {
+    std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
+    for (const auto &change : changes) {
+      auto item = std::make_unique<detail::Item>();
+      item->robot_id = change.robot_id;
+      detail::Item *raw = item.get();
+      operation->items.push_back(std::move(item));
+      detail::Entry *entry = impl_->find_active(change.robot_id);
+      if (!entry) {
+        raw->resolved.store(static_cast<int>(Outcome::unknown_robot));
+        continue;
+      }
+      raw->entry = entry;
+      raw->provisional = Outcome::conflict;  // not applied
+      std::int64_t ticket = 0;
+      {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        operation->unresolved.fetch_add(1, std::memory_order_acq_rel);
+        ticket = entry->add_ticket(operation, raw);
+      }
+      sm::EventPayload payload;
+      payload["ticket"] = ticket;
+      payload["instance"] = expected_instance;
+      payload["revision"] = as_payload(change.expected_revision);
+      payload["deadline"] = deadline_ns ? static_cast<std::int64_t>(*deadline_ns) : no_deadline;
+      bool posted = false;
+      {
+        std::lock_guard<std::mutex> order(entry->post_order);
+        posted = impl_->post(*entry, ev::Release, std::move(payload));
+      }
+      if (posted) {
+        needs_tick = true;
+      } else {
+        impl_->fail_closed(*entry, "the event queue of the machine is full");
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->resolve(ticket, Outcome::conflict);
+      }
     }
   }
+  if (needs_tick)
+    impl_->wake();
   return Pending(std::move(operation));
 }
 
@@ -546,26 +585,33 @@ bool Domain::observe(const std::string &robot_id, double linear_speed, double an
     binding = entry->binding;
     revision = state.revision;
   }
+  bool posted = false;
   if (report != 0)
-    impl_->post(*entry, report, {{"binding", as_payload(binding)}, {"revision", as_payload(revision)}});
+    posted = impl_->post(*entry, report, {{"binding", as_payload(binding)}, {"revision", as_payload(revision)}});
+  roster.unlock();
+  if (posted)
+    impl_->wake();
   return true;
 }
 
 bool Domain::set_fault(const std::string &robot_id, const std::string &message) {
-  std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
-  detail::Entry *entry = impl_->find_active(robot_id);
-  if (!entry)
-    return false;
-  const std::string fault = clean_text(message);
-  if (fault.empty()) {
-    impl_->post(*entry, ev::ClearFault, {});
-    return true;
+  {
+    std::shared_lock<std::shared_mutex> roster(impl_->roster_mutex);
+    detail::Entry *entry = impl_->find_active(robot_id);
+    if (!entry)
+      return false;
+    const std::string fault = clean_text(message);
+    if (fault.empty()) {
+      impl_->post(*entry, ev::ClearFault, {});
+    } else {
+      // A fault holds the robot: the engage and the fault are one step in the queue, so that no release can come
+      // between them and leave the robot released with a fault.
+      std::lock_guard<std::mutex> order(entry->post_order);
+      impl_->engage_ordered(*entry, nullptr, nullptr);
+      impl_->post(*entry, ev::Fault, {{"text", fault}});
+    }
   }
-  // A fault holds the robot: the engage and the fault are one step in the queue, so that no release can come
-  // between them and leave the robot released with a fault.
-  std::lock_guard<std::mutex> order(entry->post_order);
-  impl_->engage_ordered(*entry, nullptr, nullptr);
-  impl_->post(*entry, ev::Fault, {{"text", fault}});
+  impl_->wake();
   return true;
 }
 

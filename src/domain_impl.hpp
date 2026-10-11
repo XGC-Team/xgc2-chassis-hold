@@ -126,6 +126,10 @@ struct DomainImpl {
   // Runs the machine until its inbox is empty (bounded); true if it took any event. Tick thread.
   bool drain(Entry &entry);
   void notify();
+  // Tells the host that the tick has work (DomainOptions::wake). No lock of the domain may be held.
+  void wake() noexcept;
+  // The roster change behind Domain::add; needs_tick says whether the tick has an event to apply afterwards.
+  bool add_robot(const std::string &robot_id, bool feedback, bool &needs_tick);
 
   DomainOptions options;
   TimeNs start = 0;

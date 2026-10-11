@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using namespace xgc2::chassis_hold;
 
@@ -203,6 +204,44 @@ TEST(release_fence_drops_commands_received_before_release) {
   CHECK(!domain.admit("r", fence + 1));
   CHECK(!domain.admit("r", clock.ns - 1));
   CHECK(domain.admit("r", clock.ns));
+}
+
+// A host whose callbacks queue commands (a ROS callback queue, a simulator's input queue) dispatches them in its own
+// time. Each command carries the stamp of its arrival and admit() compares that stamp with the release fence, so the
+// host does not drain its queue before a release.
+TEST(commands_queued_before_the_release_are_refused_although_they_are_dispatched_after_it) {
+  FakeClock clock;
+  Domain domain(clock.options());
+  Sink sink;
+  domain.add("r");
+  struct Queued {
+    int id;
+    TimeNs received;
+  };
+  std::vector<Queued> queue;
+
+  clock.advance(1);
+  queue.push_back({1, clock.ns});  // arrived while the robot was free, and is still waiting
+  engaged(domain, sink, {"r"});
+  clock.advance(10);
+  queue.push_back({2, clock.ns});  // arrived while held
+  clock.advance(10);
+  const Pending release = domain.release(domain.instance_id(), {{"r", 1}});
+  clock.advance(10);
+  queue.push_back({3, clock.ns});  // arrived after the release call, before the tick applied it
+  clock.advance(10);
+  domain.tick(sink);
+  REQUIRE(release.done());
+  clock.advance(10);
+  queue.push_back({4, clock.ns});  // arrived after the release was applied
+  clock.advance(10);
+
+  std::vector<int> dispatched;  // the host's loop gets to the queue only now
+  for (const auto &command : queue)
+    if (domain.admit("r", command.received))
+      dispatched.push_back(command.id);
+  REQUIRE(dispatched.size() == 1);
+  CHECK_EQ(dispatched[0], 4);
 }
 
 TEST(a_release_queued_before_an_engage_cannot_open_the_gate) {
@@ -760,6 +799,131 @@ TEST(a_flood_without_a_tick_fails_closed) {
   CHECK(release.done() ? release.results()[0].outcome != Outcome::released : true);
   CHECK(get(domain, "a").held);
   CHECK(!domain.admit("a", clock.ns));
+}
+
+// DomainOptions::wake: once per call that leaves the tick something to apply, never for a call that changes nothing.
+TEST(the_host_is_woken_whenever_the_tick_has_work) {
+  FakeClock clock;
+  std::atomic<int> woken{0};
+  DomainOptions options = clock.options();
+  options.wake = [&woken] { ++woken; };
+  Domain domain(options);
+  Sink sink;
+  domain.add("a");
+  domain.add("b");
+  CHECK_EQ(woken.load(), 0);  // a robot added released needs nothing
+
+  domain.engage({"a", "b"});
+  CHECK_EQ(woken.load(), 1);  // once per call, not per robot
+  domain.engage({"nobody"});
+  CHECK_EQ(woken.load(), 1);  // nothing to apply
+  domain.tick(sink);
+  CHECK_EQ(woken.load(), 1);  // the tick does not wake itself
+
+  domain.engage({"a"});  // idempotent, and still an event of the machine
+  CHECK_EQ(woken.load(), 2);
+  domain.engage_all();
+  CHECK_EQ(woken.load(), 3);
+  domain.tick(sink);
+
+  domain.release(domain.instance_id(), {{"a", 1}, {"b", 1}});
+  CHECK_EQ(woken.load(), 4);
+  domain.release(domain.instance_id(), {{"nobody", 1}});
+  CHECK_EQ(woken.load(), 4);
+  domain.tick(sink);
+
+  CHECK(domain.set_fault("b", "bus off"));
+  CHECK_EQ(woken.load(), 5);
+  CHECK(domain.set_fault("b", ""));
+  CHECK_EQ(woken.load(), 6);
+  CHECK(!domain.set_fault("nobody", "bus off"));
+  CHECK_EQ(woken.load(), 6);
+  domain.tick(sink);
+
+  // Roster changes: a held robot that comes back needs the tick to write its zero to the new device; a removal,
+  // and a robot that comes back released, need nothing.
+  CHECK(domain.remove("b"));
+  CHECK_EQ(woken.load(), 6);
+  CHECK(domain.add("b"));
+  CHECK_EQ(woken.load(), 7);
+  CHECK(!domain.add("b"));  // already in the roster
+  CHECK_EQ(woken.load(), 7);
+  CHECK(!domain.remove("nobody"));
+  CHECK_EQ(woken.load(), 7);
+  domain.tick(sink);
+  CHECK(domain.set_fault("b", ""));  // no fault to clear is still an event of the machine
+  domain.release(domain.instance_id(), {{"b", get(domain, "b").revision}});
+  domain.tick(sink);
+  CHECK(!get(domain, "b").held);
+  const int before = woken.load();
+  CHECK(domain.remove("b"));
+  CHECK(domain.add("b"));
+  CHECK_EQ(woken.load(), before);  // released: nothing to rebind
+}
+
+TEST(a_robot_added_held_wakes_the_host) {
+  std::atomic<int> woken{0};
+  DomainOptions options;
+  options.boot_held = true;
+  options.wake = [&woken] { ++woken; };
+  Domain domain(options);
+  domain.add("a");
+  CHECK_EQ(woken.load(), 1);
+  domain.add("b");
+  CHECK_EQ(woken.load(), 2);
+  CHECK(!domain.add("a"));
+  CHECK_EQ(woken.load(), 2);
+}
+
+TEST(feedback_that_moves_a_stage_wakes_the_host) {
+  FakeClock clock;
+  std::atomic<int> woken{0};
+  DomainOptions options = clock.options();
+  options.wake = [&woken] { ++woken; };
+  Domain domain(options);  // 300 ms dwell
+  domain.add("r", true);
+  Sink sink;
+  engaged(domain, sink, {"r"});
+  const int base = woken.load();
+  const TimeNs zero = *get(domain, "r").zero_written_at;
+
+  CHECK(domain.observe("r", 0.0, 0.0, zero));
+  CHECK(domain.observe("r", 0.0, 0.0, zero + 100 * ms));
+  CHECK_EQ(woken.load(), base);  // the dwell is not over: nothing for the tick to apply
+  CHECK(domain.observe("r", 0.0, 0.0, zero + 300 * ms));
+  CHECK_EQ(woken.load(), base + 1);  // stopped
+  domain.tick(sink);
+  CHECK(domain.observe("r", 0.0, 0.0, zero + 310 * ms));
+  CHECK_EQ(woken.load(), base + 1);  // still at rest
+  CHECK(domain.observe("r", 0.5, 0.0, zero + 320 * ms));
+  CHECK_EQ(woken.load(), base + 2);  // moving again
+}
+
+TEST(the_wake_callback_runs_outside_the_locks_and_may_throw) {
+  Domain *self = nullptr;
+  std::atomic<int> woken{0};
+  DomainOptions options;
+  options.wake = [&] {
+    ++woken;
+    // A host may look at the domain from its wake-up: nothing of the domain is locked, and the operation that
+    // woke it has taken effect already.
+    CHECK(!self->admit("a", self->now()));
+    CHECK(self->state({"a"}).robots[0].held);
+    self->describe();
+    throw std::runtime_error("the loop of the host is gone");
+  };
+  Domain domain(options);
+  self = &domain;
+  domain.add("a");
+  const Pending pending = domain.engage({"a"});  // does not throw
+  CHECK_EQ(woken.load(), 1);
+  CHECK_EQ(pending.results()[0].outcome, Outcome::engaged);
+  CHECK(!domain.admit("a", domain.now()));
+  Sink sink;
+  domain.tick(sink);
+  CHECK(domain.set_fault("a", "bus off"));
+  CHECK_EQ(woken.load(), 2);
+  CHECK_EQ(get(domain, "a").revision, 1);
 }
 
 TEST(options_and_identity) {

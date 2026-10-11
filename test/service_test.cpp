@@ -6,8 +6,10 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <future>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -455,6 +457,57 @@ TEST(a_release_waits_for_the_tick_and_is_not_applied_after_its_call_gave_up) {
   const ServiceReply done = future.get();
   CHECK_EQ(done.status, Status::ok);
   CHECK_EQ(body_of(done)["robots"][0]["outcome"].get<std::string>(), "released");
+}
+
+// A control loop that sleeps until it is woken: DomainOptions::wake is all the host has to connect.
+TEST(a_sleeping_host_loop_is_woken_by_the_requests) {
+  std::mutex mutex;
+  std::condition_variable woken;
+  bool work = false;
+  bool stop = false;
+  DomainOptions domain_options;
+  domain_options.wake = [&] {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      work = true;
+    }
+    woken.notify_one();
+  };
+  Domain domain(domain_options);
+  domain.add("a");
+  ServiceOptions options;
+  options.reply_wait = seconds(10);
+  options.release_wait = seconds(10);
+  Service service(domain, options);
+  Sink sink;
+  std::thread host([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (!stop) {
+      woken.wait_for(lock, seconds(60), [&] { return work || stop; });
+      work = false;
+      lock.unlock();
+      domain.tick(sink);  // this thread is the tick thread
+      lock.lock();
+    }
+  });
+
+  const auto started = Clock::now();
+  const ServiceReply engage = service.call("Engage", "{\"robot_ids\":[\"a\"]}");
+  CHECK_EQ(engage.status, Status::ok);
+  CHECK_EQ(body_of(engage)["robots"][0]["stage"].get<std::string>(), "zero_written");
+  const ServiceReply release = service.call(
+      "Release", release_body(domain.instance_id(), "[{\"robot_id\":\"a\",\"expected_revision\":1}]"));
+  CHECK_EQ(release.status, Status::ok);
+  CHECK_EQ(body_of(release)["robots"][0]["outcome"].get<std::string>(), "released");
+  CHECK(Clock::now() - started < seconds(5));  // nobody polled: the requests woke the loop
+  CHECK(domain.admit("a", domain.now()));
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    stop = true;
+  }
+  woken.notify_one();
+  host.join();
 }
 
 TEST(requests_are_closed_schemas) {
