@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the whole test suite under ThreadSanitizer, then under AddressSanitizer + UndefinedBehaviorSanitizer; the XRPC
-# udp component is built with the same sanitizer.
+# components are built with the same sanitizer. xgc2-state-machine is the installed package, not instrumented: its
+# synchronization is mutexes, which the sanitizers intercept.
 # Usage: run-sanitizers.sh <scratch directory> <dependency checkouts directory>   (the directory holds xrpc/)
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -12,7 +13,7 @@ for sanitizer in thread address,undefined; do
   name="${sanitizer//,/-}"
   flags="-fsanitize=$sanitizer -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
   prefix="$work/xrpc-$name"
-  "$root/.xgc2/scripts/install-xrpc-udp.sh" "$deps/xrpc" "$prefix" "-DCMAKE_CXX_FLAGS=$flags"
+  "$root/.xgc2/scripts/install-xrpc.sh" "$deps/xrpc" "$prefix" "-DCMAKE_CXX_FLAGS=$flags"
   build="$work/$name"
   mkdir -p "$build"
   (

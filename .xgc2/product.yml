@@ -3,7 +3,7 @@ id: libxgc2-chassis-hold-dev
 name: XGC2 Chassis HOLD
 version: 0.2.0-1
 kind: toolchain-apt
-summary: Chassis HOLD domain library, transport-neutral JSON service, udp.v1 endpoint and xgc2-hold tool shared by XGC2 chassis drivers and simulation hosts.
+summary: Chassis HOLD library shared by the XGC2 chassis drivers and simulation hosts - a state machine per robot on xgc2-state-machine, served as the XRPC capability xgc2.chassis.hold through a udp.v1 endpoint (drivers) or an http.v1 adapter (world hosts), with the facade a host instantiates and the xgc2-hold tool.
 apt:
   distribution: bionic,focal,jammy,noble
   install:
@@ -12,14 +12,16 @@ apt:
   - libxgc2-chassis-hold1
   - libxgc2-chassis-hold-dev
   depends:
-  - libxgc2-xrpc-udp1 (>= 0.1.0)
+  - libxgc2-state-machine-dev (>= 0.1.3)
+  - libxgc2-xrpc-udp1 (>= 0.2.0)
+  - libxgc2-xrpc2 (>= 0.2.0)
   - libc6
   - libgcc1 | libgcc-s1
   - libstdc++6
 usage:
   install: sudo apt install libxgc2-chassis-hold-dev
   smoke_test: cmake --find-package -DNAME=XgcChassisHold -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++17. find_package(XgcChassisHold CONFIG COMPONENTS core udp); XgcChassisHold::core is the domain and the JSON service, XgcChassisHold::udp adds the udp.v1 endpoint for chassis drivers. /usr/bin/xgc2-hold is the command line client. Command-gated completion does not confirm physical rest.
+  notes: C++17. find_package(XgcChassisHold CONFIG COMPONENTS core udp http); XgcChassisHold::core is the facade ChassisHold, the domain (a state machine per robot) and the JSON service, XgcChassisHold::udp adds the udp.v1 endpoint for chassis drivers, XgcChassisHold::http adds the adapter that serves xgc2.chassis.hold on a world host's XRPC http.v1 server. The http component needs the XRPC http runtime (libxgc2-xrpc2) and is not part of the bionic packages. /usr/bin/xgc2-hold is the command line client. Command-gated completion does not confirm physical rest.
 ownership:
   paths:
   - /usr/include/xgc2/chassis_hold
@@ -33,8 +35,10 @@ release:
   workflow: release.yml
   ci_workflow: ci.yml
   requires:
+  - libxgc2-state-machine-dev
   - xgc2-xrpc
   dependency_policy:
+    libxgc2-state-machine-dev: rebuild
     xgc2-xrpc: rebuild
   apt_versions:
     bionic: 0.2.0-1~bionic

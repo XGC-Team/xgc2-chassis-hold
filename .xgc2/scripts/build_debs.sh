@@ -2,8 +2,9 @@
 # Build, test and package against the installed toolchain. Outputs are never overwritten.
 # Usage: build_debs.sh <fresh work directory> <output directory>
 # PACKAGE_DISTRIBUTION names the distribution the packages are for (default: this system's codename).
-# The XRPC udp component is found through CMAKE_PREFIX_PATH when it is not installed system-wide; the libraries of
-# such a prefix are listed in XGC2_SHLIBDEPS_PATH (colon separated) so that dpkg-shlibdeps can read them.
+# The XRPC udp and http components and xgc2-state-machine are found through CMAKE_PREFIX_PATH when they are not
+# installed system-wide; the libraries of such a prefix are listed in XGC2_SHLIBDEPS_PATH (colon separated) so that
+# dpkg-shlibdeps can read them. Ubuntu 18.04 gets no http component: the Boost it needs is newer than bionic's.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$root" show -s --format=%ct HEAD)}"
@@ -40,6 +41,11 @@ cmake_args=("-DCMAKE_BUILD_TYPE=RelWithDebInfo" "-DCMAKE_INSTALL_PREFIX=/usr" "-
 if [[ "$distribution" == focal ]]; then
   cmake_args+=("-DXGC2_CHASSIS_HOLD_WERROR=ON")
 fi
+with_http=ON
+if [[ "$distribution" == bionic ]]; then
+  with_http=OFF
+fi
+cmake_args+=("-DXGC2_CHASSIS_HOLD_BUILD_HTTP=$with_http")
 # No `cmake -S/-B` and no `--parallel`: Ubuntu 18.04 ships CMake 3.10.
 mkdir -p "$work/build"
 (cd "$work/build" && cmake "$root" "${cmake_args[@]}")
@@ -63,13 +69,24 @@ strip --strip-unneeded "$runtime/usr/bin/xgc2-hold"
 {
   printf 'libxgc2_chassis_hold 1 %s (>= %s)\n' "$runtime_package" "$version"
   printf 'libxgc2_chassis_hold_udp 1 %s (>= %s)\n' "$runtime_package" "$version"
+  if [[ "$with_http" == ON ]]; then
+    printf 'libxgc2_chassis_hold_http 1 %s (>= %s)\n' "$runtime_package" "$version"
+  fi
 } > "$runtime/DEBIAN/shlibs"
 mkdir -p "$work/debian"
 printf 'Source: xgc2-chassis-hold\nSection: libs\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n\nPackage: %s\nArchitecture: any\nDescription: Chassis HOLD\n' \
   "$runtime_package" > "$work/debian/control"
 cp "$runtime/DEBIAN/shlibs" "$work/debian/shlibs.local"
-# The XRPC udp runtime package, whether the library came from it or from a private prefix of the build.
-printf 'libxgc2_xrpc_udp 1 libxgc2-xrpc-udp1 (>= 0.1.0)\n' >> "$work/debian/shlibs.local"
+# The runtime packages of the libraries we link, whether they came from the packages or from a private prefix of the
+# build: xgc2-state-machine ships its library in the development package, XRPC has one runtime package for udp and
+# one for the rest of the C++ components (generation 2 of 0.2.0).
+{
+  printf 'libxgc2_state_machine 0 libxgc2-state-machine-dev (>= 0.1.3)\n'
+  printf 'libxgc2_xrpc_udp 1 libxgc2-xrpc-udp1 (>= 0.2.0)\n'
+  for library in http unix diagnostics bootstrap; do
+    printf 'libxgc2_xrpc_%s 2 libxgc2-xrpc2 (>= 0.2.0)\n' "$library"
+  done
+} >> "$work/debian/shlibs.local"
 shlibdeps_args=()
 IFS=: read -r -a extra_library_paths <<<"${XGC2_SHLIBDEPS_PATH:-}"
 for path in "${extra_library_paths[@]}"; do
@@ -93,10 +110,19 @@ Priority: optional
 Maintainer: XGC Team <apt@example.com>
 Depends: $depends
 Description: XGC2 chassis HOLD runtime
- Domain library, transport-neutral JSON service and udp.v1 endpoint for chassis
- command gating, and the xgc2-hold command line client.
+ Chassis command gating as a state machine per robot, the facade a host
+ instantiates, the XRPC service xgc2.chassis.hold with its udp.v1 endpoint
+ and, where the XRPC http component exists, its http.v1 adapter, and the
+ xgc2-hold command line client.
 CONTROL
 printf 'activate-noawait ldconfig\n' > "$runtime/DEBIAN/triggers"
+# The CMake package of the http component names the XRPC http target, so its development package comes along.
+dev_depends="$runtime_package (= $version)"
+components="core and udp"
+if [[ "$with_http" == ON ]]; then
+  dev_depends="$dev_depends, libxgc2-xrpc-dev (>= 0.2.0)"
+  components="core, udp and http"
+fi
 cat > "$dev/DEBIAN/control" <<CONTROL
 Package: $dev_package
 Version: $version
@@ -104,9 +130,9 @@ Architecture: $arch
 Section: libdevel
 Priority: optional
 Maintainer: XGC Team <apt@example.com>
-Depends: $runtime_package (= $version)
+Depends: $dev_depends
 Description: XGC2 chassis HOLD development files
- C++17 headers, CMake package XgcChassisHold (components core and udp) and the HOLD contract.
+ C++17 headers, CMake package XgcChassisHold (components $components) and the HOLD contract.
 CONTROL
 for spec in "runtime $runtime_package" "dev $dev_package"; do
   read -r dir package <<<"$spec"
