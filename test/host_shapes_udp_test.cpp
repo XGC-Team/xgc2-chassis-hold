@@ -366,6 +366,13 @@ public:
     hold.tick();
   }
 
+  bool drove(double linear) const {
+    for (const auto &command : base.commands())
+      if (command.linear == linear)
+        return true;
+    return false;
+  }
+
   std::function<TimeNs()> clock = [] { return ros::Time::now().toNSec(); };
   ScoutBase base;
   ScoutZero zero;
@@ -464,6 +471,15 @@ TEST(a_scout_style_driver_polls_the_can_state_and_reports_a_dead_bus) {
   CHECK_EQ(engaged["robots"][0]["stage"].get<std::string>(), "zero_written");
   CHECK(eventually([&] { return caller.state("scout-1").stage == Stage::stopped; }));  // polled CAN state: at rest
 
+  const std::size_t commands = driver.base.commands().size();
+  driver.cmd_vel.publish(drive(0.9));
+  CHECK(fixtures::wait_until([&] { return driver.base.commands().size() > commands + 2; }));
+  CHECK(!driver.drove(0.9));
+  for (const auto &command : driver.base.commands()) {
+    // The only nonzero command so far was admitted before the engage.
+    CHECK(command.linear == 0.0 || command.linear == 0.8);
+  }
+
   driver.base.set_can_down(true);
   CHECK(eventually([&] { return caller.state("scout-1").stage == Stage::gated; }));
   CHECK_EQ(caller.state("scout-1").fault, "zero write failed: CAN bus off");
@@ -471,10 +487,57 @@ TEST(a_scout_style_driver_polls_the_can_state_and_reports_a_dead_bus) {
   CHECK(eventually([&] { return zeroed(caller.state("scout-1").stage); }));
   CHECK(caller.state("scout-1").fault.empty());
 
+  const std::uint64_t revision = caller.state("scout-1").revision;
+  const json stale = caller.ok(
+      "Release", json{{"expected_instance", driver.hold.instance_id()},
+                      {"changes", json::array({json{{"robot_id", "scout-1"}, {"expected_revision", revision - 1}}})}});
+  CHECK_EQ(first_outcome(stale), "conflict");
+  CHECK(caller.state("scout-1").held);
+
+  // Queue a held receipt until after release. The following fresh command is
+  // dispatched after it by the FIFO, so observing the fresh write also proves
+  // the stale receipt has been processed and rejected.
+  driver.cmd_vel.publish(drive(0.5), milliseconds(150));
   const json released = caller.ok(
       "Release", json{{"expected_instance", driver.hold.instance_id()},
-                      {"changes", json::array({json{{"robot_id", "scout-1"}, {"expected_revision", caller.state("scout-1").revision}}})}});
+                      {"changes", json::array({json{{"robot_id", "scout-1"}, {"expected_revision", revision}}})}});
   CHECK_EQ(released["robots"][0]["outcome"].get<std::string>(), "released");
+  driver.cmd_vel.publish(drive(0.6));
+  CHECK(fixtures::wait_until([&] { return driver.drove(0.6); }));
+  CHECK(!driver.drove(0.5));
+  CHECK(!driver.drove(0.9));
+
+  caller.ok("Engage", json{{"all", true}});
+  const json replay = caller.ok(
+      "Release", json{{"expected_instance", driver.hold.instance_id()},
+                      {"changes", json::array({json{{"robot_id", "scout-1"}, {"expected_revision", revision}}})}});
+  CHECK_EQ(first_outcome(replay), "conflict");
+  CHECK(caller.state("scout-1").held);
+}
+
+TEST(a_restarted_driver_shape_rejects_a_previous_instances_release_even_when_revisions_match) {
+  TempDir dir;
+  const std::string key_file = dir.write("hold.key", key_line(key_id, key_bytes));
+  std::string old_instance;
+  std::uint64_t old_revision = 0;
+  {
+    WheeltecDriver previous(key_file, /*boot_held=*/true);
+    const Caller caller(previous.endpoint);
+    old_instance = previous.hold.instance_id();
+    old_revision = caller.state("wheeltec-1").revision;
+  }
+  WheeltecDriver restarted(key_file, /*boot_held=*/true);
+  const Caller caller(restarted.endpoint);
+  CHECK(restarted.hold.instance_id() != old_instance);
+  CHECK_EQ(caller.state("wheeltec-1").revision, old_revision);
+  const json stale = caller.ok(
+      "Release", json{{"expected_instance", old_instance},
+                      {"changes", json::array({json{{"robot_id", "wheeltec-1"}, {"expected_revision", old_revision}}})}});
+  CHECK_EQ(first_outcome(stale), "conflict");
+  CHECK(caller.state("wheeltec-1").held);
+  restarted.cmd_vel.publish(drive(0.7));
+  CHECK(fixtures::wait_until([&] { return restarted.link.frames().size() > 5; }));
+  CHECK(!restarted.drove(0.7));
 }
 
 TEST(a_scout_style_driver_without_a_usable_key_exits_or_runs_without_the_endpoint) {

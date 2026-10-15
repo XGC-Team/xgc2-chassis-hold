@@ -35,6 +35,20 @@ chassis_hold_test(facade_test)
 chassis_hold_test(concurrency_test)
 chassis_hold_test(tick_test)
 
+# In a full product checkout, lexically inventory reviewed driver call sites.
+# This source check is repeated in installed mode; native driver runtime tests
+# establish execution. Standalone consumers need no robotics checkout.
+set(XGC2_CHASSIS_HOLD_ROBOTICS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../robotics"
+  CACHE PATH "Native robotics sources for the HOLD lexical callsite inventory")
+if(EXISTS "${XGC2_CHASSIS_HOLD_ROBOTICS_ROOT}/wheeltec/onboard/ros1/chassis/src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp"
+    AND EXISTS "${XGC2_CHASSIS_HOLD_ROBOTICS_ROOT}/agilex/onboard/ros1/chassis/src/scout_base/src/scout_messenger.cpp")
+  find_package(PythonInterp 3 REQUIRED)
+  add_test(NAME chassis_hold_native_driver_contract_test COMMAND ${PYTHON_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/native_driver_contract_test.py
+    --robotics-root ${XGC2_CHASSIS_HOLD_ROBOTICS_ROOT})
+  set_tests_properties(chassis_hold_native_driver_contract_test PROPERTIES TIMEOUT 10)
+endif()
+
 # The udp.v1 endpoint with the xrpc client, and the xgc2-hold tool; $TMPDIR holds the key files of the tests.
 if(TARGET XgcChassisHold::udp)
   add_executable(chassis_hold_udp_endpoint_test udp_endpoint_test.cpp)
