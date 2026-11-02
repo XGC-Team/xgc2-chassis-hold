@@ -36,8 +36,6 @@ TimeNs steady_now() {
       .count();
 }
 
-std::int64_t as_payload(std::uint64_t value) { return static_cast<std::int64_t>(value); }
-
 }  // namespace
 
 std::string clean_text(const std::string &text) {
@@ -139,11 +137,9 @@ RobotState DomainImpl::view(Entry &entry) const {
   return state;
 }
 
-bool DomainImpl::post(Entry &entry, sm::EventId id, sm::EventPayload payload) {
-  sm::Event event(id);
-  event.payload = std::move(payload);
+bool DomainImpl::post(Entry &entry, ev::Event event) {
   std::lock_guard<std::mutex> work_lock(work_mutex);
-  if (!entry.machine->postEvent(std::move(event)).ok())
+  if (!post_hold_event(*entry.machine, std::move(event)))
     return false;
   entry.pending.store(true, std::memory_order_release);
   work.try_emplace(entry.id, &entry);
@@ -182,7 +178,7 @@ void DomainImpl::engage_ordered(Entry &entry, const std::shared_ptr<Operation> &
       ticket = entry.add_ticket(operation, item);
     }
   }
-  if (!post(entry, ev::Engage, {{"ticket", ticket}, {"at", static_cast<std::int64_t>(at)}})) {
+  if (!post(entry, ev::Engage{ticket, at})) {
     // The machine cannot take the event: the gate stays closed for good and the caller gets what the gate decided.
     fail_closed(entry, "the event queue of the machine is full");
     std::lock_guard<std::mutex> lock(entry.mutex);
@@ -193,42 +189,25 @@ void DomainImpl::engage_ordered(Entry &entry, const std::shared_ptr<Operation> &
 bool DomainImpl::drain(Entry &entry) {
   if (!entry.pending.exchange(false, std::memory_order_acq_rel))
     return false;
-  const auto wrong_thread = [](const sm::Status &status) {
-    if (status.code == sm::ErrorCode::kWrongOwnerThread)
-      throw std::logic_error("Domain::tick must always run on the same thread");
-  };
   // The entry mutex is held around the machine's calls: its callbacks change the published state of the robot, and
   // a reader (state, admit, a transport) must never see half a transition. Nothing in a callback waits for a thread.
   if (!entry.started) {
-    sm::Status status;
     {
       std::lock_guard<std::mutex> lock(entry.mutex);
-      status = entry.machine->start();
-    }
-    wrong_thread(status);
-    if (!status.ok()) {
-      fail_closed(entry, status.message);
-      return false;
+      start_hold_machine(*entry.machine, entry);
     }
     entry.started = true;
   }
   bool progressed = false;
   for (int round = 0; round < 64; ++round) {
-    sm::Result<sm::UpdateResult> result;
+    HoldDrainRound result;
     {
       std::lock_guard<std::mutex> lock(entry.mutex);
-      result = entry.machine->update(sm::UpdateOptions{1, 16, false});
+      result = update_hold_machine(*entry.machine, entry, 1);
     }
-    wrong_thread(result.status);
-    if (!result.ok()) {
-      fail_closed(entry, result.status.message);
-      return progressed;
-    }
-    if (result.value.faults_recorded > 0)
-      fail_closed(entry, "a callback of the machine failed");
-    if (result.value.events_taken > 0)
+    if (result.events_taken > 0)
       progressed = true;
-    if (result.value.events_remaining == 0)
+    if (result.events_remaining == 0)
       return progressed;
   }
   // The bounded drain left work for the next tick. A concurrent post also keeps pending set.
@@ -307,7 +286,6 @@ bool detail::DomainImpl::add_robot(const std::string &robot_id, bool feedback, b
     if (robots.size() >= options.max_robots)
       throw std::length_error("chassis hold roster is full");
     auto entry = std::make_unique<detail::Entry>(*this, robot_id);
-    entry->machine = detail::make_hold_machine(*entry);
     entry->active = true;
     entry->binding = 1;
     entry->state.feedback = feedback;
@@ -351,7 +329,7 @@ bool detail::DomainImpl::add_robot(const std::string &robot_id, bool feedback, b
     }
   }
   if (rebind) {
-    post(entry, ev::Rebound, {{"binding", as_payload(binding)}, {"at", static_cast<std::int64_t>(at)}});
+    post(entry, ev::Rebound{binding, at});
     needs_tick = true;
   }
   return true;
@@ -445,14 +423,10 @@ Pending Domain::release(const std::string &expected_instance, const std::vector<
         ticket = entry->add_ticket(operation, raw);
         raw->ticket = ticket;
       }
-      sm::EventPayload payload;
-      payload["ticket"] = ticket;
-      payload["instance"] = expected_instance;
-      payload["revision"] = as_payload(change.expected_revision);
       bool posted = false;
       {
         std::lock_guard<std::mutex> order(entry->post_order);
-        posted = impl_->post(*entry, ev::Release, std::move(payload));
+        posted = impl_->post(*entry, ev::Release{ticket, expected_instance, change.expected_revision});
       }
       if (posted) {
         needs_tick = true;
@@ -564,19 +538,17 @@ TickStats Domain::tick(ZeroSink &sink) {
   for (auto &target : targets) {
     if (target.entry->gate.load(std::memory_order_acquire) & kBrokenBit)
       continue;  // the machine failed: the robot stays held and nothing follows
-    sm::EventId id = 0;
+    std::optional<ev::Event> report;
     if (!target.ok) {
-      id = ev::ZeroFailed;
+      report = ev::ZeroFailed{
+          target.binding,
+          target.revision,
+          target.error.empty() ? std::string("zero write failed") : target.error};
     } else if (target.stage == Stage::gated && !target.faulted) {
-      id = ev::ZeroWritten;
+      report = ev::ZeroWritten{target.binding, target.revision};
     }
-    if (id != 0) {
-      sm::EventPayload payload;
-      payload["binding"] = as_payload(target.binding);
-      payload["revision"] = as_payload(target.revision);
-      if (!target.ok)
-        payload["error"] = target.error.empty() ? std::string("zero write failed") : target.error;
-      target.reported = impl_->post(*target.entry, id, std::move(payload));
+    if (report) {
+      target.reported = impl_->post(*target.entry, std::move(*report));
     }
   }
   for (const auto &target : targets)
@@ -610,9 +582,7 @@ bool Domain::observe(const std::string &robot_id, double linear_speed, double an
   detail::Entry *entry = impl_->find_active(robot_id);
   if (!entry)
     return false;
-  sm::EventId report = 0;
-  std::uint64_t binding = 0;
-  std::uint64_t revision = 0;
+  std::optional<ev::Event> report;
   {
     std::lock_guard<std::mutex> lock(entry->mutex);
     RobotState &state = entry->state;
@@ -632,19 +602,17 @@ bool Domain::observe(const std::string &robot_id, double linear_speed, double an
     if (!at_rest) {
       entry->rest_since.reset();
       if (state.stage == Stage::stopped)
-        report = ev::MotionResumed;
+        report = ev::MotionResumed{entry->binding, state.revision};
     } else {
       if (!entry->rest_since)
         entry->rest_since = stamp_ns;
       if (state.stage == Stage::zero_written && elapsed_ns(stamp_ns, *entry->rest_since) >= impl_->dwell_ns)
-        report = ev::MotionStopped;
+        report = ev::MotionStopped{entry->binding, state.revision};
     }
-    binding = entry->binding;
-    revision = state.revision;
   }
   bool posted = false;
-  if (report != 0)
-    posted = impl_->post(*entry, report, {{"binding", as_payload(binding)}, {"revision", as_payload(revision)}});
+  if (report)
+    posted = impl_->post(*entry, std::move(*report));
   roster.unlock();
   if (posted)
     impl_->wake();
@@ -659,13 +627,13 @@ bool Domain::set_fault(const std::string &robot_id, const std::string &message) 
       return false;
     const std::string fault = clean_text(message);
     if (fault.empty()) {
-      impl_->post(*entry, ev::ClearFault, {});
+      impl_->post(*entry, ev::ClearFault{});
     } else {
       // A fault holds the robot: the engage and the fault are one step in the queue, so that no release can come
       // between them and leave the robot released with a fault.
       std::lock_guard<std::mutex> order(entry->post_order);
       impl_->engage_ordered(*entry, nullptr, nullptr);
-      impl_->post(*entry, ev::Fault, {{"text", fault}});
+      impl_->post(*entry, ev::Fault{fault});
     }
   }
   impl_->wake();

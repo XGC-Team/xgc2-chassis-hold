@@ -1,42 +1,83 @@
 #pragma once
-// Internals of Domain: the roster entries with their state machines (hold_machine.cpp) and the operations.
+// Internals of Domain: the roster entries with their ADT state machines (hold_machine.cpp) and the operations.
 #include "text.hpp"
 
 #include <xgc2/chassis_hold/domain.hpp>
 
-#include <state_machine/state_machine.hpp>
+#include <state_machine/adt.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
+#include <vector>
 
 namespace xgc2::chassis_hold {
-namespace sm = state_machine;
+namespace adt = state_machine::adt;
 
 namespace ev {
-// The events of a robot's machine.
-enum : sm::EventId {
-  Engage = 1,     // ticket, at
-  Release,        // ticket, instance, revision
-  ZeroWritten,    // binding, revision: the device took a zero command
-  ZeroFailed,     // binding, revision, error
-  MotionStopped,  // binding, revision: feedback showed rest for the dwell
-  MotionResumed,  // binding, revision: feedback showed motion again
-  Fault,          // text
-  ClearFault,
-  Rebound,  // at: the robot was added to the roster again, for a new device
+// Algebraic Sum Type of a robot's hold state machine events (zero heap map/string key lookups).
+struct Engage {
+  std::int64_t ticket{0};
+  TimeNs at{0};
 };
-}  // namespace ev
 
-namespace st {
-// Its states. Held contains Gated, ZeroWritten, Stopped and Faulted.
-enum : sm::StateId { Released = 1, Held, Gated, ZeroWritten, Stopped, Faulted };
-}  // namespace st
+struct Release {
+  std::int64_t ticket{0};
+  std::string instance;
+  std::uint64_t revision{0};
+};
+
+struct ZeroWritten {
+  std::uint64_t binding{0};
+  std::uint64_t revision{0};
+};
+
+struct ZeroFailed {
+  std::uint64_t binding{0};
+  std::uint64_t revision{0};
+  std::string error;
+};
+
+struct MotionStopped {
+  std::uint64_t binding{0};
+  std::uint64_t revision{0};
+};
+
+struct MotionResumed {
+  std::uint64_t binding{0};
+  std::uint64_t revision{0};
+};
+
+struct Fault {
+  std::string text;
+};
+
+struct ClearFault {};
+
+struct Rebound {
+  std::uint64_t binding{0};
+  TimeNs at{0};
+};
+
+using Event = std::variant<
+    Engage,
+    Release,
+    ZeroWritten,
+    ZeroFailed,
+    MotionStopped,
+    MotionResumed,
+    Fault,
+    ClearFault,
+    Rebound>;
+}  // namespace ev
 
 constexpr TimeNs no_fence = std::numeric_limits<TimeNs>::min();
 
@@ -52,6 +93,7 @@ namespace detail {
 
 struct DomainImpl;
 struct Entry;
+class HoldMachine;
 
 // One robot of one engage or release call.
 struct Item {
@@ -69,7 +111,8 @@ struct Operation {
 };
 
 struct Entry {
-  Entry(DomainImpl &domain_in, std::string id_in) : domain(domain_in), id(std::move(id_in)) { state.robot_id = id; }
+  Entry(DomainImpl &domain_in, std::string id_in);
+  ~Entry();
   Entry(const Entry &) = delete;
   Entry &operator=(const Entry &) = delete;
 
@@ -87,8 +130,8 @@ struct Entry {
   std::atomic<std::uint32_t> gate{0};
   std::atomic<TimeNs> fence{no_fence};  // host-clock time of the last release
   bool started = false;                 // the machine is started: tick thread only
-  std::atomic<bool> pending{false};       // the inbox may need an update
-  std::unique_ptr<sm::StateMachine> machine;
+  std::atomic<bool> pending{false};     // the inbox may need an update
+  std::unique_ptr<HoldMachine> machine;
 
   // Everything below is guarded by the mutex, which the machine's callbacks take as well.
   mutable std::mutex mutex;
@@ -122,7 +165,7 @@ struct DomainImpl {
   // The same with entry.post_order already held by the caller.
   void engage_ordered(Entry &entry, const std::shared_ptr<Operation> &operation, Item *item);
   // Posts an event to the machine. No lock of the entry may be held. False if the machine refused it.
-  bool post(Entry &entry, sm::EventId id, sm::EventPayload payload);
+  bool post(Entry &entry, ev::Event event);
   // The robot stays held for good: the machine could not follow.
   void fail_closed(Entry &entry, const std::string &why);
   // Runs the machine until its inbox is empty (bounded); true if it took any event. Tick thread.
@@ -166,8 +209,16 @@ struct DomainImpl {
   std::uint64_t next_token = 1;
 };
 
-// Builds the machine of a robot (hold_machine.cpp). Its callbacks belong to the tick thread and take the entry mutex.
-std::unique_ptr<sm::StateMachine> make_hold_machine(Entry &entry);
+struct HoldDrainRound {
+  std::size_t events_taken{0};
+  std::size_t events_remaining{0};
+};
+
+// Builds the ADT machine of a robot (hold_machine.cpp). Its transitions belong to the tick thread and take the entry mutex.
+std::unique_ptr<HoldMachine> make_hold_machine(Entry &entry);
+bool post_hold_event(HoldMachine &machine, ev::Event event);
+void start_hold_machine(HoldMachine &machine, Entry &entry);
+HoldDrainRound update_hold_machine(HoldMachine &machine, Entry &entry, std::size_t max_events);
 
 }  // namespace detail
 }  // namespace xgc2::chassis_hold

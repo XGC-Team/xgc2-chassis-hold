@@ -1,19 +1,24 @@
-// The state machine of one robot.
+// The Algebraic Data Type (ADT) state machine of one robot.
 //
-//   Released ---------- Engage ----------> Held
+//   HoldStateVariant = ReleasedState + HeldState(GatedStage + ZeroWrittenStage + StoppedStage + FaultedStage)
+//
+//   Released ---------- Engage ----------> Held(Gated)
 //   Held ------- Release [instance, revision, no fault, not withdrawn] -----> Released
 //
-//   Held contains          Gated --ZeroWritten--> ZeroWritten --MotionStopped--> Stopped
-//                          ZeroWritten, Stopped --ZeroFailed--> Gated      Stopped --MotionResumed--> ZeroWritten
-//                          Gated, ZeroWritten, Stopped --Fault--> Faulted --ClearFault--> Gated
-//                          ZeroWritten, Stopped, Faulted --Rebound--> Gated
+//   Held substates:
+//     Gated --ZeroWritten--> ZeroWritten --MotionStopped--> Stopped
+//     ZeroWritten, Stopped --ZeroFailed--> Gated
+//     Stopped --MotionResumed--> ZeroWritten
+//     Gated, ZeroWritten, Stopped, Faulted --Fault--> Faulted --ClearFault--> Gated
+//     Gated, ZeroWritten, Stopped, Faulted --Rebound--> Gated
 //
-// The machine runs on the tick thread (update). Domain::drain holds the entry mutex around start() and every update(),
-// so the callbacks below change the published state of the entry and the gate mirror without taking it again, and a
+// The machine runs on the tick thread. Domain::drain holds the entry mutex around start() and every update(),
+// so transitions change the published state of the entry and the gate mirror without taking it again, and a
 // reader never sees half a transition. Outcomes of engage and release are decided here and handed to whoever waits
-// for them through the ticket in the event.
+// for them through the ticket in the strongly-typed event struct.
 #include "domain_impl.hpp"
 
+#include <deque>
 #include <stdexcept>
 #include <utility>
 
@@ -21,28 +26,12 @@ namespace xgc2::chassis_hold {
 namespace {
 
 using detail::Entry;
-
-std::int64_t number(const sm::Event &event, const char *key, std::int64_t fallback = 0) {
-  const auto found = event.payload.find(key);
-  if (found == event.payload.end())
-    return fallback;
-  const auto *value = std::get_if<std::int64_t>(&found->second);
-  return value ? *value : fallback;
-}
-
-std::string text(const sm::Event &event, const char *key) {
-  const auto found = event.payload.find(key);
-  if (found == event.payload.end())
-    return std::string();
-  const auto *value = std::get_if<std::string>(&found->second);
-  return value ? *value : std::string();
-}
+constexpr std::size_t kMaxPendingEvents = 4096;
 
 // Zero results and motion reports are about one device and one hold: a late one describes an earlier hold or the
 // device that was removed.
-bool current(const Entry &entry, const sm::Event &event) {
-  return static_cast<std::uint64_t>(number(event, "binding")) == entry.binding &&
-         static_cast<std::uint64_t>(number(event, "revision")) == entry.state.revision;
+bool current(const Entry &entry, std::uint64_t binding, std::uint64_t revision) {
+  return binding == entry.binding && revision == entry.state.revision;
 }
 
 void forget_progress(Entry &entry) {
@@ -66,264 +55,309 @@ void apply_gate(Entry &entry, bool consume_engage, bool hold) {
   }
 }
 
-class StageState : public sm::State {
-public:
-  StageState(Entry &entry, const char *name) : entry_(entry), name_(name) {}
-  std::string name() const override { return name_; }
-
-protected:
-  void enter(Stage stage) {
-    entry_.state.stage = stage;
-  }
-  Entry &entry_;
-  const char *name_;
+struct GatedStage {
+  static constexpr Stage kPublishedStage = Stage::gated;
 };
 
-class ReleasedState final : public StageState {
-public:
-  explicit ReleasedState(Entry &entry) : StageState(entry, "Released") {}
-  sm::ActionResult onEnter(sm::StateContext &) override {
-    enter(Stage::released);
-    return {};
-  }
-  // Nothing consumed a release: there is nothing to release, unless the caller is stale.
-  sm::ActionResult onEvent(sm::StateContext &, const sm::Event &event) override {
-    if (event.id == ev::Release) {
-      const bool stale = text(event, "instance") != entry_.domain.options.instance_id;
-      entry_.resolve(number(event, "ticket"), stale ? Outcome::conflict : Outcome::not_held);
-    }
-    return {};
-  }
+struct ZeroWrittenStage {
+  static constexpr Stage kPublishedStage = Stage::zero_written;
 };
 
-class HeldState final : public StageState {
-public:
-  explicit HeldState(Entry &entry) : StageState(entry, "Held") {}
-  // The guard of the release refused it: the wrong instance or revision, a fault, or the caller withdrew it (then
-  // the ticket is gone and nobody waits for the outcome).
-  sm::ActionResult onEvent(sm::StateContext &, const sm::Event &event) override {
-    if (event.id == ev::Release)
-      entry_.resolve(number(event, "ticket"), Outcome::conflict);
-    return {};
-  }
-};
-
-class GatedState final : public StageState {
-public:
-  explicit GatedState(Entry &entry) : StageState(entry, "Gated") {}
-  sm::ActionResult onEnter(sm::StateContext &) override {
-    enter(Stage::gated);
-    return {};
-  }
-};
-
-class ZeroWrittenState final : public StageState {
-public:
-  explicit ZeroWrittenState(Entry &entry) : StageState(entry, "ZeroWritten") {}
-  sm::ActionResult onEnter(sm::StateContext &) override {
-    enter(Stage::zero_written);
-    return {};
-  }
-};
-
-class StoppedState final : public StageState {
-public:
-  explicit StoppedState(Entry &entry) : StageState(entry, "Stopped") {}
-  sm::ActionResult onEnter(sm::StateContext &) override {
-    enter(Stage::stopped);
-    return {};
-  }
+struct StoppedStage {
+  static constexpr Stage kPublishedStage = Stage::stopped;
 };
 
 // A faulted robot is held with its zero not trusted: the stage it reports is gated.
-class FaultedState final : public StageState {
-public:
-  explicit FaultedState(Entry &entry) : StageState(entry, "Faulted") {}
-  sm::ActionResult onEnter(sm::StateContext &) override {
-    enter(Stage::gated);
-    return {};
+struct FaultedStage {
+  static constexpr Stage kPublishedStage = Stage::gated;
+};
+
+using HeldSubstate = std::variant<
+    GatedStage,
+    ZeroWrittenStage,
+    StoppedStage,
+    FaultedStage>;
+
+Stage publishedStageOf(const HeldSubstate &sub) {
+  return std::visit(
+      [](const auto &s) -> Stage {
+        using T = std::decay_t<decltype(s)>;
+        return T::kPublishedStage;
+      },
+      sub);
+}
+
+struct ReleasedState {};
+
+struct HeldState {
+  HeldSubstate substate{GatedStage{}};
+};
+
+using HoldStateVariant = std::variant<ReleasedState, HeldState>;
+using HoldTransition = adt::Transition<HoldStateVariant, std::string>;
+
+HoldTransition onReleasedEvent(ReleasedState &, Entry &entry, const ev::Event &event) {
+  return std::visit(
+      adt::Overloaded{
+          [&](const ev::Engage &e) -> HoldTransition {
+            entry.state.held = true;
+            ++entry.state.revision;
+            entry.state.gated_at = e.at;
+            forget_progress(entry);
+            apply_gate(entry, true, true);
+            entry.resolve(e.ticket, Outcome::engaged);
+            return HoldTransition::to(HeldState{GatedStage{}});
+          },
+          [&](const ev::Release &e) -> HoldTransition {
+            const bool stale = e.instance != entry.domain.options.instance_id;
+            entry.resolve(e.ticket, stale ? Outcome::conflict : Outcome::not_held);
+            return HoldTransition::stay();
+          },
+          [&](const auto &) -> HoldTransition {
+            return HoldTransition::stay();
+          }},
+      event);
+}
+
+HoldTransition onHeldEvent(HeldState &held, Entry &entry, const ev::Event &event) {
+  return std::visit(
+      adt::Overloaded{
+          [&](const ev::Engage &e) -> HoldTransition {
+            apply_gate(entry, true, true);
+            entry.resolve(e.ticket, Outcome::already_held);
+            return HoldTransition::stay();
+          },
+          [&](const ev::Release &e) -> HoldTransition {
+            const bool allowed =
+                entry.tickets.count(e.ticket) == 1 &&
+                e.instance == entry.domain.options.instance_id &&
+                e.revision == entry.state.revision &&
+                entry.state.fault.empty();
+            if (!allowed) {
+              entry.resolve(e.ticket, Outcome::conflict);
+              return HoldTransition::stay();
+            }
+            entry.fence.store(entry.domain.now(), std::memory_order_release);
+            entry.state.held = false;
+            ++entry.state.revision;
+            entry.state.gated_at.reset();
+            forget_progress(entry);
+            apply_gate(entry, false, false);
+            entry.resolve(e.ticket, Outcome::released);
+            return HoldTransition::to(ReleasedState{});
+          },
+          [&](const ev::ZeroWritten &e) -> HoldTransition {
+            if (!current(entry, e.binding, e.revision))
+              return HoldTransition::stay();
+            if (std::holds_alternative<GatedStage>(held.substate)) {
+              const TimeNs now = entry.domain.now();
+              entry.state.zero_written_at = now;
+              entry.state.write_error.clear();
+              entry.rest_since.reset();
+              entry.last_sample.reset();
+              return HoldTransition::to(HeldState{ZeroWrittenStage{}});
+            }
+            return HoldTransition::stay();
+          },
+          [&](const ev::ZeroFailed &e) -> HoldTransition {
+            if (!current(entry, e.binding, e.revision))
+              return HoldTransition::stay();
+            ++entry.state.zero_write_failed;
+            entry.state.write_error =
+                clean_text(e.error.empty() ? "zero write failed" : e.error);
+            if (std::holds_alternative<ZeroWrittenStage>(held.substate) ||
+                std::holds_alternative<StoppedStage>(held.substate)) {
+              entry.state.zero_written_at.reset();
+              entry.state.stopped_at.reset();
+              entry.rest_since.reset();
+              entry.last_sample.reset();
+              return HoldTransition::to(HeldState{GatedStage{}});
+            }
+            return HoldTransition::stay();
+          },
+          [&](const ev::MotionStopped &e) -> HoldTransition {
+            if (!current(entry, e.binding, e.revision))
+              return HoldTransition::stay();
+            if (std::holds_alternative<ZeroWrittenStage>(held.substate)) {
+              entry.state.stopped_at = entry.domain.now();
+              return HoldTransition::to(HeldState{StoppedStage{}});
+            }
+            return HoldTransition::stay();
+          },
+          [&](const ev::MotionResumed &e) -> HoldTransition {
+            if (!current(entry, e.binding, e.revision))
+              return HoldTransition::stay();
+            if (std::holds_alternative<StoppedStage>(held.substate)) {
+              entry.state.stopped_at.reset();
+              return HoldTransition::to(HeldState{ZeroWrittenStage{}});
+            }
+            return HoldTransition::stay();
+          },
+          [&](const ev::Fault &e) -> HoldTransition {
+            entry.state.fault = clean_text(e.text);
+            entry.state.zero_written_at.reset();
+            entry.state.stopped_at.reset();
+            entry.rest_since.reset();
+            entry.last_sample.reset();
+            if (std::holds_alternative<FaultedStage>(held.substate))
+              return HoldTransition::stay();
+            return HoldTransition::to(HeldState{FaultedStage{}});
+          },
+          [&](const ev::ClearFault &) -> HoldTransition {
+            if (std::holds_alternative<FaultedStage>(held.substate)) {
+              entry.state.fault.clear();
+              return HoldTransition::to(HeldState{GatedStage{}});
+            }
+            return HoldTransition::stay();
+          },
+          [&](const ev::Rebound &e) -> HoldTransition {
+            entry.state.gated_at = e.at;
+            entry.state.fault.clear();
+            forget_progress(entry);
+            if (std::holds_alternative<GatedStage>(held.substate))
+              return HoldTransition::stay();
+            return HoldTransition::to(HeldState{GatedStage{}});
+          }},
+      event);
+}
+
+struct HoldMachineSpec {
+  using StateVariant = HoldStateVariant;
+  using EventVariant = ev::Event;
+  using OutputVariant = std::monostate;
+  using Context = Entry;
+  using RejectReason = std::string;
+  using OutputBuffer = adt::BoundedVector<OutputVariant, 4>;
+
+  static void onEnter(ReleasedState &, Context &entry, double, OutputBuffer &) {
+    entry.state.stage = Stage::released;
+  }
+
+  static void onEnter(HeldState &held, Context &entry, double, OutputBuffer &) {
+    entry.state.stage = publishedStageOf(held.substate);
+  }
+
+  template <typename ConcreteEvent>
+  static HoldTransition onEvent(
+      ReleasedState &released, Context &entry, const ConcreteEvent &event, double, OutputBuffer &) {
+    return onReleasedEvent(released, entry, ev::Event{event});
+  }
+
+  template <typename ConcreteEvent>
+  static HoldTransition onEvent(
+      HeldState &held, Context &entry, const ConcreteEvent &event, double, OutputBuffer &) {
+    return onHeldEvent(held, entry, ev::Event{event});
+  }
+
+  static adt::TickPolicy tickPolicy(const ReleasedState &, const Context &, double, double) {
+    return adt::TickIdle{};
+  }
+
+  static adt::TickPolicy tickPolicy(const HeldState &, const Context &, double, double) {
+    return adt::TickPeriodic{0.02};
   }
 };
 
 }  // namespace
 
-std::int64_t detail::Entry::add_ticket(const std::shared_ptr<detail::Operation> &operation, detail::Item *item) {
+namespace detail {
+
+class HoldMachine {
+ public:
+  HoldMachine() : adt_machine_(HoldStateVariant{ReleasedState{}}) {}
+
+  bool postEvent(ev::Event event) {
+    std::lock_guard<std::mutex> lock(inbox_mutex_);
+    if (inbox_.size() >= kMaxPendingEvents)
+      return false;
+    inbox_.push_back(std::move(event));
+    return true;
+  }
+
+  void start(Entry &entry) {
+    checkOwnerThread();
+    adt_machine_.start(entry, 0.0);
+  }
+
+  HoldDrainRound update(Entry &entry, std::size_t max_events) {
+    checkOwnerThread();
+    HoldDrainRound round;
+    while (round.events_taken < max_events) {
+      std::optional<ev::Event> next_event;
+      {
+        std::lock_guard<std::mutex> lock(inbox_mutex_);
+        if (inbox_.empty()) {
+          round.events_remaining = 0;
+          break;
+        }
+        next_event = std::move(inbox_.front());
+        inbox_.pop_front();
+        round.events_remaining = inbox_.size();
+      }
+      ++round.events_taken;
+      (void)adt_machine_.dispatch(entry, *next_event, 0.0);
+    }
+    (void)adt_machine_.step(entry, 0.0);
+    return round;
+  }
+
+ private:
+  void checkOwnerThread() {
+    const auto caller = std::this_thread::get_id();
+    if (owner_thread_ == std::thread::id()) {
+      owner_thread_ = caller;
+    } else if (owner_thread_ != caller) {
+      throw std::logic_error("Domain::tick must always run on the same thread");
+    }
+  }
+
+  std::mutex inbox_mutex_;
+  std::deque<ev::Event> inbox_;
+  std::thread::id owner_thread_;
+  adt::AdtMachine<HoldMachineSpec, 4, 8, 8> adt_machine_;
+};
+
+Entry::Entry(DomainImpl &domain_in, std::string id_in)
+    : domain(domain_in),
+      id(std::move(id_in)),
+      machine(std::make_unique<HoldMachine>()) {
+  state.robot_id = id;
+}
+
+Entry::~Entry() = default;
+
+std::int64_t Entry::add_ticket(const std::shared_ptr<Operation> &operation, Item *item) {
   const std::int64_t ticket = next_ticket++;
   tickets[ticket] = Ticket{operation, item};
   return ticket;
 }
 
-void detail::Entry::resolve(std::int64_t ticket, Outcome outcome) {
+void Entry::resolve(std::int64_t ticket, Outcome outcome) {
   const auto found = tickets.find(ticket);
   if (ticket == 0 || found == tickets.end())
     return;
-  detail::Item *item = found->second.item;
-  std::shared_ptr<detail::Operation> operation = std::move(found->second.operation);
+  Item *item = found->second.item;
+  std::shared_ptr<Operation> operation = std::move(found->second.operation);
   tickets.erase(found);
   item->resolved.store(static_cast<int>(outcome), std::memory_order_release);
   operation->unresolved.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-std::unique_ptr<sm::StateMachine> detail::make_hold_machine(Entry &entry) {
-  using Rule = std::function<sm::ActionResult(sm::StateContext &)>;
-  using Guard = std::function<bool(const sm::GuardContext &)>;
-  Entry *const self = &entry;
-
-  sm::RuntimeOptions options;
-  options.allow_prestart_events = true;  // the machine starts on the first tick
-  options.event_log_capacity = 8;
-  options.fault_log_capacity = 4;
-  options.max_pending_events = 4096;
-  auto builder = sm::StateMachine::builder("chassis.hold." + entry.id, options);
-  builder.region(sm::kDefaultRegion)
-      .initial(st::Released)
-      .state(st::Released).impl(std::make_unique<ReleasedState>(entry))
-      .state(st::Held).impl(std::make_unique<HeldState>(entry)).initial(st::Gated)
-        .state(st::Gated).impl(std::make_unique<GatedState>(entry))
-        .state(st::ZeroWritten).impl(std::make_unique<ZeroWrittenState>(entry))
-        .state(st::Stopped).impl(std::make_unique<StoppedState>(entry))
-        .state(st::Faulted).impl(std::make_unique<FaultedState>(entry))
-      .endState()
-      .endRegion();
-
-  // Engage: not held -> Held (revision + 1); held -> nothing changes. Either way the engage leaves the gate's
-  // "on its way" count.
-  const Rule engage_applied = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    self->state.held = true;
-    ++self->state.revision;
-    self->state.gated_at = number(event, "at");
-    forget_progress(*self);
-    apply_gate(*self, true, true);
-    self->resolve(number(event, "ticket"), Outcome::engaged);
-    return sm::Status{};
-  };
-  const Rule engage_again = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    apply_gate(*self, true, true);
-    self->resolve(number(event, "ticket"), Outcome::already_held);
-    return sm::Status{};
-  };
-
-  // Release: the guard and the action run under one hold of the entry mutex, and a caller that gives up withdraws
-  // its ticket under the same mutex, so a change is applied or withdrawn, never both. The fence is taken before
-  // admission opens, so that nothing received while held is admitted later.
-  const Guard release_allowed = [self](const sm::GuardContext &guard) {
-    const sm::Event &event = *guard.event();
-    return self->tickets.count(number(event, "ticket")) == 1 &&
-           text(event, "instance") == self->domain.options.instance_id &&
-           static_cast<std::uint64_t>(number(event, "revision")) == self->state.revision && self->state.fault.empty();
-  };
-  const Rule released = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    self->fence.store(self->domain.now(), std::memory_order_release);
-    self->state.held = false;
-    ++self->state.revision;
-    self->state.gated_at.reset();
-    forget_progress(*self);
-    apply_gate(*self, false, false);
-    self->resolve(number(event, "ticket"), Outcome::released);
-    return sm::Status{};
-  };
-
-  // Zero results of the tick.
-  const Guard is_current = [self](const sm::GuardContext &guard) {
-    return current(*self, *guard.event());
-  };
-  const Rule zero_written = [self](sm::StateContext &) {
-    const TimeNs now = self->domain.now();
-    self->state.zero_written_at = now;
-    self->state.write_error.clear();
-    self->rest_since.reset();
-    self->last_sample.reset();
-    return sm::Status{};
-  };
-  const Rule write_failed = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    ++self->state.zero_write_failed;
-    self->state.write_error = clean_text(text(event, "error").empty() ? "zero write failed" : text(event, "error"));
-    return sm::Status{};
-  };
-  // A failed write takes the confirmation of the zero back.
-  const Rule zero_lost = [self, write_failed](sm::StateContext &ctx) {
-    write_failed(ctx);
-    self->state.zero_written_at.reset();
-    self->state.stopped_at.reset();
-    self->rest_since.reset();
-    self->last_sample.reset();
-    return sm::Status{};
-  };
-
-  // Feedback.
-  const Rule stopped = [self](sm::StateContext &) {
-    const TimeNs now = self->domain.now();
-    self->state.stopped_at = now;
-    return sm::Status{};
-  };
-  const Rule resumed = [self](sm::StateContext &) {
-    self->state.stopped_at.reset();
-    return sm::Status{};
-  };
-
-  // Faults.
-  const Rule faulted = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    self->state.fault = clean_text(text(event, "text"));
-    self->state.zero_written_at.reset();
-    self->state.stopped_at.reset();
-    self->rest_since.reset();
-    self->last_sample.reset();
-    return sm::Status{};
-  };
-  const Rule fault_cleared = [self](sm::StateContext &) {
-    self->state.fault.clear();
-    return sm::Status{};
-  };
-
-  // The robot was added again: a new device, no zero yet, and the fault belonged to the old one.
-  const Rule rebound = [self](sm::StateContext &ctx) {
-    const sm::Event &event = *ctx.event();
-    self->state.gated_at = number(event, "at");
-    self->state.fault.clear();
-    forget_progress(*self);
-    return sm::Status{};
-  };
-
-  const auto internal = [&builder](sm::StateId from, sm::EventId event) -> sm::StateMachine::Builder & {
-    return builder.transition().from(from).on(event).type(sm::TransitionType::kInternal);
-  };
-  const auto transition_to = [&builder](sm::StateId from, sm::StateId to, sm::EventId event) -> sm::StateMachine::Builder & {
-    return builder.transition().from(from).to(to).on(event);
-  };
-
-  transition_to(st::Released, st::Held, ev::Engage).action(engage_applied);
-  internal(st::Held, ev::Engage).action(engage_again);
-  transition_to(st::Held, st::Released, ev::Release).priority(10).when(release_allowed).action(released);
-
-  transition_to(st::Gated, st::ZeroWritten, ev::ZeroWritten).when(is_current).action(zero_written);
-  internal(st::Gated, ev::ZeroFailed).when(is_current).action(write_failed);
-  transition_to(st::ZeroWritten, st::Gated, ev::ZeroFailed).when(is_current).action(zero_lost);
-  transition_to(st::Stopped, st::Gated, ev::ZeroFailed).when(is_current).action(zero_lost);
-  internal(st::Faulted, ev::ZeroFailed).when(is_current).action(write_failed);
-
-  transition_to(st::ZeroWritten, st::Stopped, ev::MotionStopped).when(is_current).action(stopped);
-  transition_to(st::Stopped, st::ZeroWritten, ev::MotionResumed).when(is_current).action(resumed);
-
-  transition_to(st::Gated, st::Faulted, ev::Fault).action(faulted);
-  transition_to(st::ZeroWritten, st::Faulted, ev::Fault).action(faulted);
-  transition_to(st::Stopped, st::Faulted, ev::Fault).action(faulted);
-  internal(st::Faulted, ev::Fault).action(faulted);
-  transition_to(st::Faulted, st::Gated, ev::ClearFault).action(fault_cleared);
-
-  internal(st::Gated, ev::Rebound).action(rebound);
-  transition_to(st::ZeroWritten, st::Gated, ev::Rebound).action(rebound);
-  transition_to(st::Stopped, st::Gated, ev::Rebound).action(rebound);
-  transition_to(st::Faulted, st::Gated, ev::Rebound).action(rebound);
-
-  auto built = builder.build();
-  if (!built.ok())
-    throw std::runtime_error("chassis hold state machine: " + built.status.message);
-  return std::move(built.value);
+std::unique_ptr<HoldMachine> make_hold_machine(Entry &) {
+  return std::make_unique<HoldMachine>();
 }
 
+bool post_hold_event(HoldMachine &machine, ev::Event event) {
+  return machine.postEvent(std::move(event));
+}
+
+void start_hold_machine(HoldMachine &machine, Entry &entry) {
+  machine.start(entry);
+}
+
+HoldDrainRound update_hold_machine(HoldMachine &machine, Entry &entry, std::size_t max_events) {
+  return machine.update(entry, max_events);
+}
+
+}  // namespace detail
 }  // namespace xgc2::chassis_hold
