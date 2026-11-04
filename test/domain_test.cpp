@@ -1020,4 +1020,49 @@ TEST(state_reports_requested_order_and_unknown_ids) {
   CHECK_EQ(some.unknown[1], "y");
 }
 
+// Recorded on 10c10a9: rebind clears the immediate view, but queued Fault
+// still precedes queued Rebound. Do not hide it with an additional persistent
+// overlay or change the existing 64-event drain/output ordering in this refactor.
+TEST(queued_fault_and_rebound_keep_the_original_bounded_drain_order) {
+  FakeClock clock;
+  Domain domain(clock.options());
+  Sink sink;
+  domain.add("a");
+  engaged(domain, sink, {"a"});
+  for (int i = 0; i < 62; ++i) domain.engage({"a"});
+  domain.set_fault("a", "old_fault");
+  domain.remove("a");
+  clock.advance(1);
+  domain.add("a");
+  CHECK(get(domain, "a").fault.empty());
+  CHECK_EQ(get(domain, "a").stage, Stage::gated);
+  domain.tick(sink);  // 62 Engage + Engage + Fault; Rebound remains queued
+  CHECK_EQ(get(domain, "a").fault, "old_fault");
+  CHECK_EQ(get(domain, "a").stage, Stage::gated);
+  domain.tick(sink);
+  CHECK(get(domain, "a").fault.empty());
+  CHECK_EQ(get(domain, "a").stage, Stage::zero_written);
+  CHECK_EQ(get(domain, "a").revision, 1);
+}
+
+TEST(rebind_clears_the_old_device_fault_before_an_already_queued_release) {
+  FakeClock clock;
+  Domain domain(clock.options());
+  Sink sink;
+  domain.add("a");
+  domain.set_fault("a", "old device fault");
+  domain.tick(sink);
+  REQUIRE(!get(domain, "a").fault.empty());
+  const auto release = domain.release(domain.instance_id(), {{"a", 1}});
+  domain.remove("a");
+  clock.advance(1);
+  domain.add("a");
+  domain.tick(sink);
+  REQUIRE(release.done());
+  CHECK_EQ(release.results()[0].outcome, Outcome::released);
+  CHECK(!get(domain, "a").held);
+  CHECK(!domain.admit("a", clock.ns - 1));
+  CHECK(domain.admit("a", clock.ns));
+}
+
 TEST_MAIN()

@@ -207,7 +207,7 @@ public:
   bool admit(const std::string &robot_id, TimeNs receipt_time_ns) const;
 
   // Host native tick, every control cycle on the thread that owns device output (after the command callbacks
-  // of the cycle). It runs the state machines (their update() belongs to this thread: always call tick from the
+  // of the cycle). It runs the value-state machines (always call tick from the
   // same one, std::logic_error otherwise), writes zero for every held robot, every tick, not only once, and
   // applies the results. The first successful write after an engage advances the stage to zero_written; a failed
   // write puts it back to (or keeps it at) gated. The sink runs without domain locks, so a slow device never

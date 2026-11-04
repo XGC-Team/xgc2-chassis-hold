@@ -407,4 +407,52 @@ TEST(a_stuck_device_write_does_not_delay_the_gate) {
   CHECK(domain.admit("a", domain.now()));
 }
 
+// Feedback publication lends the confirmed-zero accumulator only while the
+// entry lock is held. Exercise its retirement against an independent observer,
+// including child changes, parent exit and device replacement.
+TEST(concurrent_feedback_survives_confirmed_zero_retirement) {
+  DomainOptions options;
+  options.stopped_dwell = milliseconds(1);
+  Domain domain(options);
+  domain.add("evidence", true);
+  Sink sink;
+  TickThread ticker(domain, sink);
+  std::atomic<bool> stop{false};
+  std::thread observer([&] {
+    unsigned sample = 0;
+    while (!stop) {
+      domain.observe("evidence", (++sample % 17 == 0) ? 0.5 : 0, 0, domain.now());
+      const auto snapshot = domain.state({"evidence"});
+      if (!snapshot.robots.empty()) {
+        const auto &state = snapshot.robots.front();
+        const bool confirmed = state.stage == Stage::zero_written || state.stage == Stage::stopped;
+        if (confirmed != state.zero_written_at.has_value())
+          test::fail(__FILE__, __LINE__, "published zero evidence lifetime mismatch");
+      }
+      std::this_thread::yield();
+    }
+  });
+  for (int round = 0; round < 120; ++round) {
+    domain.engage({"evidence"});
+    CHECK(wait_until([&] { return get(domain, "evidence").zero_written_at.has_value(); }));
+    if (round % 3 == 0) {
+      domain.set_fault("evidence", "device fault");
+      CHECK(wait_until([&] { return !get(domain, "evidence").fault.empty(); }));
+      domain.set_fault("evidence", "");
+      CHECK(wait_until([&] { return get(domain, "evidence").zero_written_at.has_value(); }));
+    }
+    if (round % 3 == 1) {
+      domain.remove("evidence");
+      domain.add("evidence", true);
+      CHECK(wait_until([&] { return get(domain, "evidence").zero_written_at.has_value(); }));
+    }
+    const auto pending = domain.release(domain.instance_id(), {{"evidence", get(domain, "evidence").revision}});
+    CHECK(wait_until([&] { return pending.done(); }));
+    CHECK_EQ(pending.results()[0].outcome, Outcome::released);
+  }
+  stop = true;
+  observer.join();
+  ticker.stop();
+}
+
 TEST_MAIN()

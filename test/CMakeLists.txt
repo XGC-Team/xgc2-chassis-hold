@@ -35,6 +35,19 @@ chassis_hold_test(facade_test)
 chassis_hold_test(concurrency_test)
 chassis_hold_test(tick_test)
 
+add_executable(chassis_hold_trace_test hold_trace_test.cpp)
+target_link_libraries(chassis_hold_trace_test PRIVATE XgcChassisHold::core)
+add_test(NAME chassis_hold_trace_test COMMAND chassis_hold_trace_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/golden/hold_trace.golden)
+
+option(XGC2_CHASSIS_HOLD_BUILD_BENCHMARKS "Build opt-in public API cost measurements" OFF)
+if(XGC2_CHASSIS_HOLD_BUILD_BENCHMARKS)
+  add_executable(chassis_hold_cost_bench hold_cost_bench.cpp)
+  target_link_libraries(chassis_hold_cost_bench PRIVATE XgcChassisHold::core)
+  add_executable(chassis_hold_handoff_bench hold_handoff_bench.cpp)
+  target_link_libraries(chassis_hold_handoff_bench PRIVATE XgcChassisHold::core Threads::Threads)
+endif()
+
 # In a full product checkout, lexically inventory reviewed driver call sites.
 # This source check is repeated in installed mode; native driver runtime tests
 # establish execution. Standalone consumers need no robotics checkout.
