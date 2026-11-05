@@ -14,7 +14,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(Threads REQUIRED)
 find_package(XgcNlohmannJson REQUIRED)
-find_package(xgc2_state_machine 0.1.3 CONFIG REQUIRED)
+find_package(xgc2_state_machine 0.2.0 CONFIG REQUIRED)
 
 # Component core: the domain (a state machine per robot), the transport-neutral JSON service and the facade a host
 # instantiates. Needs the xgc2-state-machine library and, at build time only, nlohmann-json; no header exposes either.

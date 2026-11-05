@@ -30,6 +30,6 @@ fi
 # The XGC2 repository (and, for a release, the overlay with the packages of the release train) for everything that
 # is not a stock Ubuntu package.
 "$root/.xgc2/scripts/setup-apt-source.sh"
-if ! dpkg -s libxgc2-state-machine-dev >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libxgc2-state-machine-dev
-fi
+# Install the selected repository/overlay candidate even when an older kernel is present.
+# CMake enforces the 0.2.0 header-only dependency floor.
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libxgc2-state-machine-dev

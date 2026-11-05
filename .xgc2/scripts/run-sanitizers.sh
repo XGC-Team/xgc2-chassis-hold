@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the whole test suite under ThreadSanitizer, then under AddressSanitizer + UndefinedBehaviorSanitizer; the XRPC
-# components are built with the same sanitizer. xgc2-state-machine is the installed package, not instrumented: its
-# synchronization is mutexes, which the sanitizers intercept.
+# components use the same sanitizer. The installed state kernel is header-only,
+# so its instantiated code is instrumented as part of HOLD.
 # Usage: run-sanitizers.sh <scratch directory> <dependency checkouts directory>   (the directory holds xrpc/)
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"

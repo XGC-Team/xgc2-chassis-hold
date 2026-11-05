@@ -78,10 +78,9 @@ printf 'Source: xgc2-chassis-hold\nSection: libs\nPriority: optional\nMaintainer
   "$runtime_package" > "$work/debian/control"
 cp "$runtime/DEBIAN/shlibs" "$work/debian/shlibs.local"
 # The runtime packages of the libraries we link, whether they came from the packages or from a private prefix of the
-# build: xgc2-state-machine ships its library in the development package, XRPC has one runtime package for udp and
-# one for the rest of the C++ components (generation 2 of 0.2.0).
+# build: XRPC has one runtime package for udp and one for the other C++ components.
+# The state kernel is header-only and contributes no runtime shlib dependency.
 {
-  printf 'libxgc2_state_machine 0 libxgc2-state-machine-dev (>= 0.1.3)\n'
   printf 'libxgc2_xrpc_udp 1 libxgc2-xrpc-udp1 (>= 0.2.0)\n'
   for library in http unix diagnostics bootstrap; do
     printf 'libxgc2_xrpc_%s 2 libxgc2-xrpc2 (>= 0.2.0)\n' "$library"
