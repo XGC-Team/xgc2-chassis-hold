@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: libxgc2-chassis-hold-dev
 name: XGC2 Chassis HOLD
-version: 0.2.0-1
+version: 0.2.0-2
 kind: toolchain-apt
 summary: Chassis HOLD library shared by the XGC2 chassis drivers and simulation hosts - a state machine per robot on xgc2-state-machine, served as the XRPC capability xgc2.chassis.hold through a udp.v1 endpoint (drivers) or an http.v1 adapter (world hosts), with the facade a host instantiates and the xgc2-hold tool.
 apt:
@@ -41,7 +41,7 @@ release:
     libxgc2-state-machine-dev: rebuild
     xgc2-xrpc: rebuild
   apt_versions:
-    bionic: 0.2.0-1~bionic
-    focal: 0.2.0-1~focal
-    jammy: 0.2.0-1~jammy
-    noble: 0.2.0-1~noble
+    bionic: 0.2.0-2~bionic
+    focal: 0.2.0-2~focal
+    jammy: 0.2.0-2~jammy
+    noble: 0.2.0-2~noble
